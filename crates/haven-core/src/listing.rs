@@ -93,7 +93,11 @@ impl Entry {
             .unwrap_or_default();
         let is_package = is_dir && PACKAGE_EXTS.contains(&ext.as_str());
         let hidden = name.starts_with('.') || meta.st_flags() & UF_HIDDEN != 0;
-        let tags = if with_tags { tags::read_tags(&path) } else { Vec::new() };
+        let tags = if with_tags {
+            tags::read_tags(&path)
+        } else {
+            Vec::new()
+        };
         Entry {
             sort_key: natural_key(&name),
             size: if is_dir { 0 } else { effective.len() },

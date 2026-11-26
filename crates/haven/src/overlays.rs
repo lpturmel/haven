@@ -878,12 +878,7 @@ pub fn apply_bulk_rename(ws: &mut Workspace, window: &mut Window, cx: &mut Conte
             };
             ws.close_overlay(window, cx);
             let tab = ws.active_tab().clone();
-            tab.update(cx, |t, cx| {
-                if let Some(d) = t.dir().map(|d| d.to_path_buf()) {
-                    t.reveal(d, new, cx);
-                    t.reload(cx);
-                }
-            });
+            tab.update(cx, |t, cx| t.reload_and_select(new, cx));
             ws.push_undo(undo);
             ws.show_toast(format!("Renamed {} items", paths.len()), false, cx);
         }

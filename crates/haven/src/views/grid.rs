@@ -39,6 +39,7 @@ pub fn render(tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> Any
                         let start = r * cols;
                         let end = (start + cols).min(tab.entries.len());
                         div()
+                            .w_full()
                             .flex()
                             .h(px(tile_h))
                             .px(px(10.))

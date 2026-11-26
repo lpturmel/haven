@@ -68,3 +68,15 @@ impl Store {
         store.dirty = false;
     }
 }
+
+/// Points the store at a per-process temp dir exactly once (tests run on
+/// parallel threads, so the env var must not be rewritten per test).
+#[cfg(test)]
+pub fn init_test_env() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("haven-test-state-{}", std::process::id()));
+        // SAFETY: runs once, before any test reads the variable.
+        unsafe { std::env::set_var("HAVEN_STATE_DIR", &dir) };
+    });
+}

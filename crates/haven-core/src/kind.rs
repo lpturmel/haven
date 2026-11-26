@@ -83,3 +83,34 @@ const IMAGE_EXTS: &[&str] = &[
 pub fn is_image_ext(ext: &str) -> bool {
     IMAGE_EXTS.contains(&ext)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, dir: bool, package: bool) -> Entry {
+        let mut e = Entry::from_path(std::path::Path::new("/")).unwrap();
+        e.name = name.into();
+        e.ext = std::path::Path::new(name)
+            .extension()
+            .map(|x| x.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        e.is_dir = dir;
+        e.is_package = package;
+        e
+    }
+
+    #[test]
+    fn labels() {
+        assert_eq!(kind_label(&entry("src", true, false)), "Folder");
+        assert_eq!(kind_label(&entry("Haven.app", true, true)), "Application");
+        assert_eq!(
+            kind_label(&entry("x.xcodeproj", true, true)),
+            "XCODEPROJ package"
+        );
+        assert_eq!(kind_label(&entry("main.rs", false, false)), "Rust source");
+        assert_eq!(kind_label(&entry("data.weird", false, false)), "WEIRD file");
+        assert_eq!(kind_label(&entry("Makefile", false, false)), "Document");
+        assert!(is_image_ext("png") && !is_image_ext("rs"));
+    }
+}

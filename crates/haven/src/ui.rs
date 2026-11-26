@@ -82,7 +82,7 @@ pub fn section_label(label: impl Into<SharedString>, cx: &App) -> Div {
     div()
         .text_size(px(11.))
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(t.text_faint)
+        .text_color(t.text_muted)
         .child(label.into())
 }
 

@@ -243,7 +243,10 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                     div()
                         .w(px(300.))
                         .flex_none()
-                        .truncate()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .text_size(px(12.))
                         .text_color(t.text_muted)
                         .child(parent),

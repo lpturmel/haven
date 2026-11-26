@@ -15,6 +15,10 @@ fn highlights_200kb_rust_quickly() {
     let t = Instant::now();
     let lines = haven_highlight::highlight(haven_highlight::Lang::Rust, &src, None).unwrap();
     let took = t.elapsed();
-    println!("{} bytes / {} lines highlighted in {took:?}", src.len(), lines.len());
+    println!(
+        "{} bytes / {} lines highlighted in {took:?}",
+        src.len(),
+        lines.len()
+    );
     assert!(took.as_millis() < 120, "{took:?}");
 }

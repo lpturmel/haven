@@ -11,6 +11,8 @@ pub struct Candidate {
     /// The entry name shown in the dropdown.
     pub name: String,
     pub is_dir: bool,
+    /// 0 = prefix match, 1 = substring, 2 = subsequence.
+    pub rank: u8,
 }
 
 /// Completes the last component of `input`. The typed directory prefix is kept
@@ -24,6 +26,7 @@ pub fn complete(input: &str, cwd: &Path, show_hidden: bool, limit: usize) -> Vec
                 replacement: "~/".into(),
                 name: "~".into(),
                 is_dir: true,
+                rank: 0,
             }];
         }
         None => ("", input),
@@ -73,7 +76,8 @@ pub fn complete(input: &str, cwd: &Path, show_hidden: bool, limit: usize) -> Vec
     scored
         .into_iter()
         .take(limit)
-        .map(|(_, is_dir, name)| Candidate {
+        .map(|(rank, is_dir, name)| Candidate {
+            rank,
             replacement: format!("{head}{name}{}", if is_dir { "/" } else { "" }),
             name,
             is_dir,
@@ -84,6 +88,18 @@ pub fn complete(input: &str, cwd: &Path, show_hidden: bool, limit: usize) -> Vec
 fn is_subsequence(needle: &str, hay: &str) -> bool {
     let mut it = hay.chars();
     needle.chars().all(|c| it.any(|h| h == c))
+}
+
+/// What Tab should turn `input` into: the only prefix match, or the longest
+/// common prefix of all prefix matches when it extends the input. Substring and
+/// subsequence matches are shown in the dropdown but never drive Tab.
+pub fn tab_completion(input: &str, cands: &[Candidate]) -> Option<String> {
+    let prefix: Vec<Candidate> = cands.iter().filter(|c| c.rank == 0).cloned().collect();
+    match prefix.as_slice() {
+        [] => None,
+        [only] => Some(only.replacement.clone()),
+        _ => common_prefix(&prefix).filter(|p| p.len() > input.len()),
+    }
 }
 
 /// Longest common prefix of candidate replacements (for shell-style Tab).
@@ -135,11 +151,36 @@ mod tests {
     }
 
     #[test]
+    fn tab_completes_unique_prefix_despite_fuzzy_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for d in ["tools", "lpturmel-portfolio", "todos-leptos", "tooling-old"] {
+            std::fs::create_dir(root.join(d)).unwrap();
+        }
+        let input = format!("{}/too", root.display());
+        let cands = complete(&input, Path::new("/"), false, 12);
+        assert!(cands.iter().any(|c| c.rank > 0), "fuzzy matches present");
+        // "tools" and "tooling-old" share "tool".
+        assert_eq!(
+            tab_completion(&input, &cands).unwrap(),
+            format!("{}/tool", root.display())
+        );
+        let input = format!("{}/tools", root.display());
+        let cands = complete(&input, Path::new("/"), false, 12);
+        assert_eq!(
+            tab_completion(&input, &cands).unwrap(),
+            format!("{}/tools/", root.display())
+        );
+        assert_eq!(tab_completion("x", &[]), None);
+    }
+
+    #[test]
     fn common_prefix_of_candidates() {
         let c = |s: &str| Candidate {
             replacement: s.into(),
             name: s.into(),
             is_dir: true,
+            rank: 0,
         };
         assert_eq!(
             common_prefix(&[c("~/dev/"), c("~/deploy")]).unwrap(),

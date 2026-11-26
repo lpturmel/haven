@@ -35,6 +35,20 @@ fn is_interesting(path: &Path, home: &Path) -> bool {
     if s.contains("/.") || s.contains(".app/") || s.ends_with(".app") {
         return false;
     }
+    // Build and dependency trees produce lots of "used" files nobody opened.
+    const NOISE: &[&str] = &[
+        "/node_modules/",
+        "/target/",
+        "/build/",
+        "/dist/",
+        "/vendor/",
+        "/perl5/",
+        "/site-packages/",
+        "/DerivedData/",
+    ];
+    if NOISE.iter().any(|n| s.contains(n)) {
+        return false;
+    }
     if path.starts_with(home.join("Library")) {
         return false;
     }
@@ -105,6 +119,14 @@ mod tests {
             &home
         ));
         assert!(!is_interesting(Path::new("/Users/x/.cache/a"), &home));
+        assert!(!is_interesting(
+            Path::new("/Users/x/perl5/perlbrew/build/x/mess"),
+            &home
+        ));
+        assert!(!is_interesting(
+            Path::new("/Users/x/dev/app/node_modules/a/index.js"),
+            &home
+        ));
         assert!(!is_interesting(
             Path::new("/Users/x/Applications/Foo.app"),
             &home

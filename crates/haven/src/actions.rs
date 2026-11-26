@@ -62,6 +62,7 @@ actions!(
         ToggleFoldersFirst,
         MakeDefaultViewer,
         RestoreFinder,
+        Dismiss,
     ]
 );
 
@@ -118,6 +119,7 @@ pub fn bind_keys(cx: &mut App) {
     let ws = Some(WORKSPACE);
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("escape", Dismiss, ws),
         KeyBinding::new("cmd-t", NewTab, ws),
         KeyBinding::new("cmd-w", CloseTab, ws),
         KeyBinding::new("cmd-shift-t", ReopenClosedTab, ws),

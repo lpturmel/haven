@@ -285,6 +285,12 @@ impl Tab {
 
     // ---------------------------------------------------------------- loading
 
+    /// Re-lists and then selects `paths` (e.g. items just created or renamed).
+    pub fn reload_and_select(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.pending_select = paths;
+        self.reload(cx);
+    }
+
     /// Re-lists the current location, preserving selection by path.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         if self.pending_select.is_empty() {
@@ -369,11 +375,15 @@ impl Tab {
 
     /// Second pass for large folders: tags are read after the first paint.
     fn load_tags_pass(&mut self, generation: u64, cx: &mut Context<Self>) {
-        if !haven_core::listing::needs_tag_pass(self.all_entries.len()) || !matches!(self.location, Location::Dir(_)) {
+        if !haven_core::listing::needs_tag_pass(self.all_entries.len())
+            || !matches!(self.location, Location::Dir(_))
+        {
             return;
         }
         let paths: Vec<PathBuf> = self.all_entries.iter().map(|e| e.path.clone()).collect();
-        let task = cx.background_executor().spawn(async move { haven_core::listing::read_tags_bulk(&paths) });
+        let task = cx
+            .background_executor()
+            .spawn(async move { haven_core::listing::read_tags_bulk(&paths) });
         cx.spawn(async move |this, cx| {
             let found = task.await;
             if found.is_empty() {
@@ -687,6 +697,11 @@ impl Tab {
     ) {
         window.focus(&self.focus);
         self.pending_collapse = None;
+        if modifiers.control {
+            let position = window.mouse_position();
+            self.context_item(ix, position, window, cx);
+            return;
+        }
         if click_count >= 2 {
             self.select_only(ix, cx);
             self.open_selected(window, cx);
@@ -1083,9 +1098,7 @@ mod tests {
 
     fn init(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let dir = tempfile::tempdir().unwrap().keep();
-            // SAFETY: tests set this before any threads read it.
-            unsafe { std::env::set_var("HAVEN_STATE_DIR", &dir) };
+            crate::store::init_test_env();
             crate::store::Store::init(cx);
             cx.set_global(crate::theme::Theme::dark());
         });

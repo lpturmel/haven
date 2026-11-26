@@ -47,6 +47,7 @@ pub fn render(tab: &mut Tab, window: &mut Window, cx: &mut Context<Tab>) -> AnyE
     )
     .track_scroll(tab.scroll.clone())
     .size_full()
+    .px(px(5.))
     .py(px(4.));
     columns.push(
         column_frame("col-cur", cx)
@@ -133,6 +134,7 @@ fn static_column(
                 }),
             )
             .size_full()
+            .px(px(5.))
             .py(px(4.)),
         )
         .into_any_element()
@@ -152,8 +154,8 @@ fn static_row(
     let navigable = e.is_navigable();
     div()
         .id(ix)
+        .w_full()
         .h(px(ROW_H))
-        .mx(px(5.))
         .px(px(6.))
         .flex()
         .items_center()
@@ -196,8 +198,8 @@ fn current_row(tab: &mut Tab, ix: usize, cx: &mut Context<Tab>) -> AnyElement {
     let payload = drag_payload(tab, ix);
     div()
         .id(ix)
+        .w_full()
         .h(px(ROW_H))
-        .mx(px(5.))
         .px(px(6.))
         .flex()
         .items_center()

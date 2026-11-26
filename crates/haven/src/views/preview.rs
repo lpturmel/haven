@@ -122,7 +122,17 @@ pub fn render(tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> Any
         Preview::Folder { entry, count } => {
             let entry = entry.clone();
             let count = *count;
-            hero(&entry, count.map(|c| format!("{c} items")), cx)
+            hero(
+                &entry,
+                count.map(|c| {
+                    if c == 1 {
+                        "1 item".to_string()
+                    } else {
+                        format!("{c} items")
+                    }
+                }),
+                cx,
+            )
         }
         Preview::Info(entry) => {
             let entry = entry.clone();

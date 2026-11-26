@@ -37,3 +37,16 @@ pub fn tildify(path: &std::path::Path) -> String {
         Err(_) => path.display().to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tildify_home_paths() {
+        let home = home_dir();
+        assert_eq!(tildify(&home), "~");
+        assert_eq!(tildify(&home.join("dev/x")), "~/dev/x");
+        assert_eq!(tildify(std::path::Path::new("/tmp")), "/tmp");
+    }
+}

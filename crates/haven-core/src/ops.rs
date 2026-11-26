@@ -80,14 +80,55 @@ pub enum Undo {
     Moved(Vec<(PathBuf, PathBuf)>),
     /// Items were trashed `original -> location in trash`: undo restores them.
     Trashed(Vec<(PathBuf, PathBuf)>),
+    /// Several steps, undone last-first (e.g. "trash the replaced item, then copy").
+    Batch(Vec<Undo>),
+}
+
+/// An operation that failed part-way. `undo` reverses the part that succeeded.
+#[derive(Debug)]
+pub struct OpError {
+    pub error: io::Error,
+    pub undo: Undo,
+}
+
+impl std::fmt::Display for OpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for OpError {}
+
+pub type OpResult = Result<Undo, OpError>;
+
+fn plural(n: usize) -> String {
+    if n == 1 {
+        "1 item".into()
+    } else {
+        format!("{n} items")
+    }
 }
 
 impl Undo {
     pub fn describe(&self) -> String {
         match self {
-            Undo::Created(v) => format!("Undo create ({} items)", v.len()),
-            Undo::Moved(v) => format!("Undo move ({} items)", v.len()),
-            Undo::Trashed(v) => format!("Undo trash ({} items)", v.len()),
+            Undo::Created(v) => format!("Undid create ({})", plural(v.len())),
+            Undo::Moved(v) => format!("Undid move ({})", plural(v.len())),
+            Undo::Trashed(v) => format!("Restored from Trash ({})", plural(v.len())),
+            Undo::Batch(steps) => steps
+                .last()
+                .map(Undo::describe)
+                .unwrap_or_else(|| "Undid".into()),
+        }
+    }
+
+    /// Whether undoing would do nothing.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Undo::Created(v) => v.is_empty(),
+            Undo::Moved(v) => v.is_empty(),
+            Undo::Trashed(v) => v.is_empty(),
+            Undo::Batch(steps) => steps.iter().all(Undo::is_empty),
         }
     }
 
@@ -129,6 +170,13 @@ impl Undo {
                     restored.push(orig.clone());
                 }
                 Ok(Undo::Created(restored))
+            }
+            Undo::Batch(steps) => {
+                let mut inverse = Vec::new();
+                for step in steps.iter().rev() {
+                    inverse.push(step.apply()?);
+                }
+                Ok(Undo::Batch(inverse))
             }
         }
     }
@@ -244,14 +292,15 @@ pub fn move_path(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-/// Copies or moves `sources` into `dest`. Returns an undo record.
+/// Copies or moves `sources` into `dest`. Returns an undo record; on failure
+/// the error carries an undo record for the items that were already done.
 pub fn transfer(
     kind: OpKind,
     sources: &[PathBuf],
     dest: &Path,
     policy: Conflict,
     progress: &Progress,
-) -> io::Result<Undo> {
+) -> OpResult {
     let (mut bytes, mut items) = (0, 0);
     for s in sources {
         let (b, i) = tree_size(s);
@@ -263,6 +312,7 @@ pub fn transfer(
 
     let mut created = Vec::new();
     let mut moved = Vec::new();
+    let mut replaced = Vec::new();
     let result = (|| {
         for src in sources {
             let Some(name) = src.file_name() else {
@@ -284,7 +334,7 @@ pub fn transfer(
                             ));
                         }
                         let landed = haven_macos::trash(&target).map_err(io::Error::other)?;
-                        let _ = landed;
+                        replaced.push((target.clone(), landed));
                     }
                     _ => target = unique_name(dest, &name.to_string_lossy()),
                 }
@@ -322,16 +372,26 @@ pub fn transfer(
     {
         *err = Some(e.to_string());
     }
-    let undo = if kind == OpKind::Copy {
+    let main = if kind == OpKind::Copy {
         Undo::Created(created)
     } else {
         Undo::Moved(moved)
     };
-    result.map(|_| undo)
+    // Undo runs last-first: remove the new items, then restore what they replaced.
+    let undo = if replaced.is_empty() {
+        main
+    } else {
+        Undo::Batch(vec![Undo::Trashed(replaced), main])
+    };
+    match result {
+        Ok(()) => Ok(undo),
+        Err(error) => Err(OpError { error, undo }),
+    }
 }
 
-/// Moves items to the Trash.
-pub fn trash(paths: &[PathBuf], progress: &Progress) -> io::Result<Undo> {
+/// Moves items to the Trash. On failure the error still carries the undo
+/// record for the items that were trashed.
+pub fn trash(paths: &[PathBuf], progress: &Progress) -> OpResult {
     progress
         .total_items
         .store(paths.len() as u64, Ordering::Relaxed);
@@ -341,8 +401,16 @@ pub fn trash(paths: &[PathBuf], progress: &Progress) -> io::Result<Undo> {
             break;
         }
         progress.set_current(p);
-        let landed = haven_macos::trash(p).map_err(io::Error::other)?;
-        done.push((p.clone(), landed));
+        match haven_macos::trash(p) {
+            Ok(landed) => done.push((p.clone(), landed)),
+            Err(e) => {
+                progress.finished.store(true, Ordering::Relaxed);
+                return Err(OpError {
+                    error: io::Error::other(e),
+                    undo: Undo::Trashed(done),
+                });
+            }
+        }
         progress.done_items.fetch_add(1, Ordering::Relaxed);
     }
     progress.finished.store(true, Ordering::Relaxed);
@@ -380,9 +448,12 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<Undo> {
     if target == path {
         return Ok(Undo::Moved(vec![]));
     }
-    let case_only =
-        target.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase();
-    if !case_only && fs::symlink_metadata(&target).is_ok() {
+    // On case-insensitive volumes `a` → `A` resolves to the same file: allow it.
+    // Anything else that already exists (including a different file that only
+    // differs by case on a case-sensitive volume) is refused.
+    if let Ok(existing) = fs::symlink_metadata(&target)
+        && !same_file(&existing, &fs::symlink_metadata(path)?)
+    {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("“{new_name}” already exists"),
@@ -390,6 +461,11 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<Undo> {
     }
     fs::rename(path, &target)?;
     Ok(Undo::Moved(vec![(path.to_path_buf(), target)]))
+}
+
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -482,20 +558,49 @@ impl BulkRename {
                 ));
             }
         }
-        // Two-phase via temporary names so swaps (a->b, b->a) work.
-        let mut temps = Vec::new();
-        for (i, p) in paths.iter().enumerate() {
-            let tmp = p.with_file_name(format!(".haven-rename-{}-{i}", std::process::id()));
-            fs::rename(p, &tmp)?;
-            temps.push(tmp);
+        // Two-phase via temporary names so swaps (a->b, b->a) work. Any
+        // failure rolls everything back to the original names.
+        let targets: Vec<PathBuf> = paths
+            .iter()
+            .zip(&new)
+            .map(|(p, n)| p.with_file_name(n))
+            .collect();
+        self.apply_two_phase(paths, &targets, &mut |from, to| fs::rename(from, to))
+    }
+
+    fn apply_two_phase(
+        &self,
+        paths: &[PathBuf],
+        targets: &[PathBuf],
+        rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<Undo> {
+        let temps: Vec<PathBuf> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p.with_file_name(format!(".haven-rename-{}-{i}", std::process::id())))
+            .collect();
+        for (i, (p, tmp)) in paths.iter().zip(&temps).enumerate() {
+            if let Err(e) = rename(p, tmp) {
+                for j in (0..i).rev() {
+                    let _ = fs::rename(&temps[j], &paths[j]);
+                }
+                return Err(e);
+            }
         }
-        let mut moved = Vec::new();
-        for ((orig, tmp), n) in paths.iter().zip(&temps).zip(&new) {
-            let t = orig.with_file_name(n);
-            fs::rename(tmp, &t)?;
-            moved.push((orig.clone(), t));
+        for (i, (tmp, t)) in temps.iter().zip(targets).enumerate() {
+            if let Err(e) = rename(tmp, t) {
+                for j in (0..i).rev() {
+                    let _ = fs::rename(&targets[j], &temps[j]);
+                }
+                for (tmp, orig) in temps.iter().zip(paths) {
+                    let _ = fs::rename(tmp, orig);
+                }
+                return Err(e);
+            }
         }
-        Ok(Undo::Moved(moved))
+        Ok(Undo::Moved(
+            paths.iter().cloned().zip(targets.iter().cloned()).collect(),
+        ))
     }
 }
 
@@ -671,6 +776,109 @@ mod tests {
         };
         assert!(clash.apply(&paths).is_err());
         assert!(root.join("IMG_001.jpg").exists());
+    }
+
+    #[test]
+    fn replace_is_undoable_and_restores_the_overwritten_item() {
+        let (_d, root) = setup();
+        fs::write(root.join("a.txt"), b"new").unwrap();
+        fs::create_dir(root.join("d")).unwrap();
+        fs::write(root.join("d/a.txt"), b"old").unwrap();
+        let undo = match transfer(
+            OpKind::Copy,
+            &[root.join("a.txt")],
+            &root.join("d"),
+            Conflict::Replace,
+            &Progress::default(),
+        ) {
+            Ok(u) => u,
+            // Volumes without a Trash (sandboxed CI) cannot replace.
+            Err(_) => return,
+        };
+        assert_eq!(fs::read(root.join("d/a.txt")).unwrap(), b"new");
+        assert!(matches!(undo, Undo::Batch(_)));
+        undo.apply().unwrap();
+        assert_eq!(fs::read(root.join("d/a.txt")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn partial_failure_keeps_undo_for_completed_items() {
+        let (_d, root) = setup();
+        fs::write(root.join("ok.txt"), b"x").unwrap();
+        fs::create_dir(root.join("d")).unwrap();
+        let missing = root.join("missing.txt");
+        let err = transfer(
+            OpKind::Move,
+            &[root.join("ok.txt"), missing],
+            &root.join("d"),
+            Conflict::KeepBoth,
+            &Progress::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.undo,
+            Undo::Moved(vec![(root.join("ok.txt"), root.join("d/ok.txt"))])
+        );
+        err.undo.apply().unwrap();
+        assert!(root.join("ok.txt").exists());
+    }
+
+    #[test]
+    fn trash_then_undo_restores() {
+        let (_d, root) = setup();
+        fs::write(root.join("t.txt"), b"x").unwrap();
+        let undo = match trash(&[root.join("t.txt")], &Progress::default()) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        assert!(!root.join("t.txt").exists());
+        undo.apply().unwrap();
+        assert!(root.join("t.txt").exists());
+        assert_eq!(undo.describe(), "Restored from Trash (1 item)");
+    }
+
+    #[test]
+    fn rename_refuses_to_clobber_a_different_file() {
+        let (_d, root) = setup();
+        fs::write(root.join("a"), b"1").unwrap();
+        fs::write(root.join("b"), b"2").unwrap();
+        assert!(rename(&root.join("a"), "b").is_err());
+        assert_eq!(fs::read(root.join("b")).unwrap(), b"2");
+        // Case-only rename of the same file is fine.
+        rename(&root.join("a"), "A").unwrap();
+    }
+
+    #[test]
+    fn bulk_rename_rolls_back_on_failure() {
+        let (_d, root) = setup();
+        for n in ["one", "two", "three"] {
+            fs::write(root.join(n), n.as_bytes()).unwrap();
+        }
+        let paths: Vec<PathBuf> = ["one", "two", "three"]
+            .iter()
+            .map(|n| root.join(n))
+            .collect();
+        let targets: Vec<PathBuf> = ["1", "2", "3"].iter().map(|n| root.join(n)).collect();
+        let br = BulkRename::default();
+        let mut calls = 0;
+        // Fail on the second rename of phase 2 (call index 4 of 6).
+        let res = br.apply_two_phase(&paths, &targets, &mut |from, to| {
+            calls += 1;
+            if calls == 5 {
+                Err(io::Error::other("boom"))
+            } else {
+                fs::rename(from, to)
+            }
+        });
+        assert!(res.is_err());
+        for (p, n) in paths.iter().zip(["one", "two", "three"]) {
+            assert_eq!(fs::read(p).unwrap(), n.as_bytes(), "{p:?} restored");
+        }
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            3,
+            "no temp files left"
+        );
     }
 
     #[test]

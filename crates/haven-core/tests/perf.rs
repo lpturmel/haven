@@ -17,7 +17,10 @@ fn list_and_sort_large_directory() {
     let t = Instant::now();
     sort_entries(&mut entries, &SortSpec::default());
     let name_sort = t.elapsed();
-    let spec = SortSpec { keys: vec![(SortKey::Modified, true), (SortKey::Name, false)], folders_first: true };
+    let spec = SortSpec {
+        keys: vec![(SortKey::Modified, true), (SortKey::Name, false)],
+        folders_first: true,
+    };
     let t = Instant::now();
     sort_entries(&mut entries, &spec);
     let multi = t.elapsed();

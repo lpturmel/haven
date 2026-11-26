@@ -127,6 +127,7 @@ pub fn render(tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> Any
         )
         .track_scroll(tab.scroll.clone())
         .size_full()
+        .px(px(6.))
         .pt(px(4.))
         .pb(px(12.))
         .into_any_element()
@@ -194,8 +195,8 @@ fn row(tab: &mut Tab, ix: usize, cx: &mut Context<Tab>) -> AnyElement {
 
     div()
         .id(ix)
+        .w_full()
         .h(px(ROW_H))
-        .mx(px(6.))
         .px(px(4.))
         .flex()
         .items_center()

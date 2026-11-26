@@ -139,11 +139,14 @@ impl Workspace {
             window,
             |ws, _, window, cx| {
                 if ws.path_editing {
-                    ws.end_path_edit(false, window, cx);
+                    // Refocus the file view so shortcuts keep working (e.g. after
+                    // the window was deactivated mid-edit).
+                    ws.end_path_edit(true, window, cx);
                 }
             },
         ));
-        ws._subs = subs;
+        // `add_tab` already pushed the initial tabs' subscriptions: keep them.
+        ws._subs.extend(subs);
         refresh_start_data(cx);
         refresh_pins(cx);
         // Keep drives fresh while running.
@@ -434,12 +437,9 @@ impl Workspace {
             }
             TextFieldEvent::Complete => {
                 let current = field.read(cx).text().to_string();
-                let replacement = if let Some(ix) = self.completion_ix {
-                    self.completions.get(ix).map(|c| c.replacement.clone())
-                } else if self.completions.len() == 1 {
-                    Some(self.completions[0].replacement.clone())
-                } else {
-                    complete::common_prefix(&self.completions).filter(|p| p.len() > current.len())
+                let replacement = match self.completion_ix {
+                    Some(ix) => self.completions.get(ix).map(|c| c.replacement.clone()),
+                    None => complete::tab_completion(&current, &self.completions),
                 };
                 if let Some(r) = replacement {
                     field.update(cx, |f, cx| {
@@ -551,7 +551,7 @@ impl Workspace {
         &mut self,
         position: Point<Pixels>,
         on_item: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let tab = self.active_tab().read(cx);
@@ -560,6 +560,8 @@ impl Workspace {
         let in_dir = tab.dir().is_some();
         let items = crate::overlays::build_context_menu(&selected, on_item, in_dir, has_clip, cx);
         self.context_menu = Some(ContextMenu { position, items });
+        // Take focus so Esc reaches the workspace's Dismiss binding.
+        window.focus(&self.focus);
         cx.notify();
     }
 
@@ -650,15 +652,14 @@ impl Workspace {
             let dest = dest.clone();
             async move { ops::transfer(kind, &sources, &dest, policy, &progress) }
         });
-        self.track_job(label, progress, task, vec![dest], cx);
+        self.track_job(label, progress, task, cx);
     }
 
     fn track_job(
         &mut self,
         label: String,
         progress: Arc<Progress>,
-        task: Task<std::io::Result<Undo>>,
-        select: Vec<PathBuf>,
+        task: Task<ops::OpResult>,
         cx: &mut Context<Self>,
     ) {
         let id = self.next_job;
@@ -689,28 +690,35 @@ impl Workspace {
                 if let Some(job) = ws.jobs.iter_mut().find(|j| j.id == id) {
                     job.done_at = Some(Instant::now());
                 }
-                match result {
-                    Ok(undo) => {
-                        if let Undo::Created(paths) = &undo {
-                            // Select newly created items in the active tab.
-                            let tab = ws.active_tab().clone();
-                            let parent_matches = paths
-                                .first()
-                                .and_then(|p| p.parent())
-                                .map(Path::to_path_buf);
-                            if parent_matches.as_deref() == tab.read(cx).dir() {
-                                let paths = paths.clone();
-                                tab.update(cx, |t, cx| {
-                                    t.reveal(t.dir().unwrap().to_path_buf(), paths, cx)
-                                });
-                            }
-                        }
-                        ws.undo_stack.push(undo);
+                let undo = match result {
+                    Ok(undo) => undo,
+                    Err(e) => {
+                        ws.show_toast(e.to_string(), true, cx);
+                        e.undo
                     }
-                    Err(e) => ws.show_toast(e.to_string(), true, cx),
+                };
+                // Select newly created items when they landed in the active tab's folder.
+                let created: Vec<PathBuf> = match &undo {
+                    Undo::Created(p) => p.clone(),
+                    Undo::Batch(steps) => steps
+                        .iter()
+                        .filter_map(|s| match s {
+                            Undo::Created(p) => Some(p.clone()),
+                            _ => None,
+                        })
+                        .flatten()
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if !undo.is_empty() {
+                    ws.undo_stack.push(undo);
                 }
-                let _ = &select;
-                ws.reload_active(cx);
+                ws.reload_all(cx);
+                let tab = ws.active_tab().clone();
+                let in_view = created.first().and_then(|p| p.parent()) == tab.read(cx).dir();
+                if in_view {
+                    tab.update(cx, |t, cx| t.reload_and_select(created, cx));
+                }
                 cx.notify();
             });
             cx.background_executor()
@@ -727,7 +735,7 @@ impl Workspace {
         .detach();
     }
 
-    fn reload_active(&mut self, cx: &mut Context<Self>) {
+    fn reload_all(&mut self, cx: &mut Context<Self>) {
         for tab in &self.tabs {
             tab.update(cx, |t, cx| t.reload(cx));
         }
@@ -766,7 +774,7 @@ impl Workspace {
             let progress = progress.clone();
             async move { ops::trash(&paths, &progress) }
         });
-        self.track_job(label, progress, task, vec![], cx);
+        self.track_job(label, progress, task, cx);
         if let Some(ix) = next {
             let survivor = tab
                 .read(cx)
@@ -800,7 +808,7 @@ impl Workspace {
                     Ok(_) => ws.show_toast(label, false, cx),
                     Err(e) => ws.show_toast(format!("Undo failed: {e}"), true, cx),
                 }
-                ws.reload_active(cx);
+                ws.reload_all(cx);
             });
         })
         .detach();
@@ -893,10 +901,7 @@ impl Workspace {
             Ok(path) => {
                 self.undo_stack.push(Undo::Created(vec![path.clone()]));
                 let tab = self.active_tab().clone();
-                tab.update(cx, |t, cx| {
-                    t.reveal(dir.clone(), vec![path.clone()], cx);
-                    t.reload(cx);
-                });
+                tab.update(cx, |t, cx| t.reload_and_select(vec![path.clone()], cx));
                 self.open_rename(Some(path), window, cx);
             }
             Err(e) => self.show_toast(e.to_string(), true, cx),
@@ -981,12 +986,7 @@ impl Workspace {
                 {
                     let to = to.clone();
                     let tab = self.active_tab().clone();
-                    tab.update(cx, |t, cx| {
-                        if let Some(d) = t.dir().map(Path::to_path_buf) {
-                            t.reveal(d, vec![to], cx);
-                            t.reload(cx);
-                        }
-                    });
+                    tab.update(cx, |t, cx| t.reload_and_select(vec![to], cx));
                 }
                 self.undo_stack.push(undo);
                 self.close_overlay(window, cx);
@@ -1188,9 +1188,7 @@ mod tests {
 
     fn init(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let dir = tempfile::tempdir().unwrap().keep();
-            // SAFETY: set before the store reads it; tests in this module share the value.
-            unsafe { std::env::set_var("HAVEN_STATE_DIR", &dir) };
+            crate::store::init_test_env();
             cx.set_global(crate::theme::Theme::dark());
             Store::init(cx);
             crate::icons::IconCache::init(cx);
@@ -1306,5 +1304,107 @@ mod tests {
         ws.update_in(cx, |ws, _, cx| ws.undo(cx));
         cx.run_until_parked();
         assert!(root.join("untitled folder").is_dir());
+    }
+
+    #[gpui::test]
+    async fn initial_tab_events_reach_the_workspace(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        // Context menu from the tab created by `Workspace::new`.
+        ws.update_in(cx, |ws, window, cx| {
+            let tab = ws.active_tab().clone();
+            tab.update(cx, |t, cx| {
+                t.context_item(0, gpui::point(gpui::px(10.), gpui::px(10.)), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| {
+            assert!(ws.context_menu.is_some(), "context menu opened")
+        });
+        // Esc (Dismiss) closes it and refocuses the tab.
+        ws.update_in(cx, |ws, window, cx| ws.close_overlay(window, cx));
+        ws.read_with(cx, |ws, _| assert!(ws.context_menu.is_none()));
+        // Navigation events update the persisted session.
+        ws.update_in(cx, |ws, _, cx| {
+            let tab = ws.active_tab().clone();
+            tab.update(cx, |t, cx| {
+                t.navigate(Location::Dir(root.join("projects")), true, cx)
+            });
+        });
+        cx.run_until_parked();
+        let session = cx.update(|_, cx| Store::get(cx).session.clone());
+        assert_eq!(session.tabs, vec![Some(root.join("projects"))]);
+    }
+
+    #[gpui::test]
+    async fn path_bar_tab_completes_prefix_match(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        std::fs::create_dir(root.join("tools")).unwrap();
+        std::fs::create_dir(root.join("lpturmel-portfolio")).unwrap();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        let input = format!("{}/too", root.display());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.begin_path_edit(window, cx);
+            let field = ws.path_field.clone();
+            field.update(cx, |f, cx| {
+                f.set_text(input.clone(), false, cx);
+                cx.emit(TextFieldEvent::Changed);
+            });
+        });
+        cx.run_until_parked();
+        ws.update_in(cx, |ws, _, cx| {
+            assert!(
+                ws.completions.iter().any(|c| c.rank > 0),
+                "fuzzy candidates listed"
+            );
+            ws.path_field
+                .clone()
+                .update(cx, |_, cx| cx.emit(TextFieldEvent::Complete));
+        });
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, cx| {
+            assert_eq!(
+                ws.path_field.read(cx).text(),
+                format!("{}/tools/", root.display())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn trash_then_undo_and_multi_key_sort(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        std::fs::write(root.join("b.txt"), b"bb").unwrap();
+        std::fs::write(root.join("a.txt"), b"bb").unwrap();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        ws.update_in(cx, |ws, _, cx| {
+            ws.active_tab().clone().update(cx, |t, cx| {
+                t.click_sort(haven_core::SortKey::Size, false, cx);
+                t.click_sort(haven_core::SortKey::Name, true, cx);
+                assert_eq!(t.sort.keys.len(), 2);
+                let files: Vec<_> = t
+                    .entries
+                    .iter()
+                    .filter(|e| !e.is_dir)
+                    .map(|e| e.name.clone())
+                    .collect();
+                assert_eq!(files, ["a.txt", "b.txt"], "size tie broken by name");
+                let ix = t.entries.iter().position(|e| e.name == "b.txt").unwrap();
+                t.select_only(ix, cx);
+            });
+        });
+        ws.update_in(cx, |ws, _, cx| ws.trash_selected(cx));
+        cx.run_until_parked();
+        if root.join("b.txt").exists() {
+            return; // No Trash on this volume (sandboxed CI).
+        }
+        ws.update_in(cx, |ws, _, cx| ws.undo(cx));
+        cx.run_until_parked();
+        assert!(
+            root.join("b.txt").exists(),
+            "undo restored the trashed file"
+        );
     }
 }

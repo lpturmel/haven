@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use gpui::{
     AnyElement, AppContext, Context, DragMoveEvent, Empty, ExternalPaths, FontWeight,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
-    relative,
+    SharedString, StatefulInteractiveElement, Styled, Window, deferred, div,
+    prelude::FluentBuilder, px, relative,
 };
 use haven_core::state::ViewMode;
 use haven_core::{TagColor, fmt, home_dir};
@@ -738,28 +738,32 @@ impl Workspace {
                         .into_any_element()
                 })
                 .collect();
+            // Deferred so it paints above the page content below the toolbar.
             Some(
-                div()
-                    .absolute()
-                    .top(px(34.))
-                    .left_0()
-                    .w_full()
-                    .p(px(4.))
-                    .rounded(px(8.))
-                    .bg(t.popover_bg)
-                    .border_1()
-                    .border_color(t.card_border)
-                    .shadow_lg()
-                    .occlude()
-                    .children(rows)
-                    .child(
-                        div()
-                            .px(px(10.))
-                            .pt(px(4.))
-                            .text_size(px(10.5))
-                            .text_color(t.text_faint)
-                            .child("Tab completes · ↑↓ choose · ↩ go"),
-                    ),
+                deferred(
+                    div()
+                        .absolute()
+                        .top(px(34.))
+                        .left_0()
+                        .w_full()
+                        .p(px(4.))
+                        .rounded(px(8.))
+                        .bg(t.popover_bg)
+                        .border_1()
+                        .border_color(t.card_border)
+                        .shadow_lg()
+                        .occlude()
+                        .children(rows)
+                        .child(
+                            div()
+                                .px(px(10.))
+                                .pt(px(4.))
+                                .text_size(px(10.5))
+                                .text_color(t.text_faint)
+                                .child("Tab completes · ↑↓ choose · ↩ go"),
+                        ),
+                )
+                .with_priority(1),
             )
         } else {
             None
@@ -892,7 +896,7 @@ impl Workspace {
                         div()
                             .text_size(px(10.))
                             .text_color(t.text_faint)
-                            .child("⌘P"),
+                            .child("⌘F"),
                     ),
             )
             .child(
@@ -1117,6 +1121,7 @@ impl Render for Workspace {
                 Store::flush(cx);
                 cx.quit()
             }))
+            .on_action(cx.listener(|ws, _: &Dismiss, window, cx| ws.close_overlay(window, cx)))
             .on_action(cx.listener(|ws, _: &NewTab, window, cx| ws.add_tab(Location::Start, true, window, cx)))
             .on_action(cx.listener(|ws, _: &CloseTab, window, cx| ws.close_tab(ws.active, window, cx)))
             .on_action(cx.listener(|ws, _: &ReopenClosedTab, window, cx| ws.reopen_closed(window, cx)))
