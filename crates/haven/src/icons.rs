@@ -55,7 +55,7 @@ fn decode_png(png: &[u8]) -> Option<(Arc<RenderImage>, usize)> {
     let mut rgba = image::load_from_memory_with_format(png, image::ImageFormat::Png)
         .ok()?
         .into_rgba8();
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     let bytes = rgba.len();
