@@ -3,6 +3,19 @@
 Haven is a macOS file manager written in Rust with GPUI (`gpui = "=0.2.2"`). It is meant to replace Finder.
 The design plan lives in `docs/PLAN.md`.
 
+## Autonomy
+Agents working on this repo are autonomous and **do not need the owner's approval** to proceed. That covers:
+- picking up and fixing bugs;
+- branching and committing;
+- pushing;
+- opening, validating and merging PRs;
+- starting validation sessions.
+
+Don't stop to ask "should I continue?" or "ok to merge?". Decide, act, and report what you did. The guardrails that still apply are the workflow below (every PR passes the 3-tier validation before merging) and these limits:
+- never force-push `main`;
+- never touch files outside the repo and scratch folders under `/tmp`;
+- never change system settings such as the default file viewer on the owner's machine.
+
 ## Layout
 - `crates/haven-core`: filesystem logic. It has no gpui dependency, covering listing, sorting, path resolution, tags, volumes, recents, file operations, fuzzy find, watching and persisted state.
 - `crates/haven-highlight`: tree-sitter syntax highlighting for the preview pane.
