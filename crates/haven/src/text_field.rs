@@ -41,6 +41,8 @@ actions!(
         Up,
         Down,
         Complete,
+        Undo,
+        Redo,
     ]
 );
 
@@ -76,6 +78,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", Up, c),
         KeyBinding::new("down", Down, c),
         KeyBinding::new("tab", Complete, c),
+        // Text undo. Without these, ⌘Z in a field fell through to the
+        // workspace and undid the last *file operation*.
+        KeyBinding::new("cmd-z", Undo, c),
+        KeyBinding::new("cmd-shift-z", Redo, c),
     ]);
 }
 
@@ -101,6 +107,11 @@ pub struct TextField {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     was_focused: bool,
+    /// Text undo/redo: earlier (content, selection) states.
+    undo_stack: Vec<(SharedString, Range<usize>)>,
+    redo_stack: Vec<(SharedString, Range<usize>)>,
+    /// The state after the last edit, pushed on the next one.
+    snapshot: (SharedString, Range<usize>),
 }
 
 impl EventEmitter<TextFieldEvent> for TextField {}
@@ -118,6 +129,9 @@ impl TextField {
             last_bounds: None,
             is_selecting: false,
             was_focused: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            snapshot: ("".into(), 0..0),
         }
     }
 
@@ -144,6 +158,10 @@ impl TextField {
         };
         self.selection_reversed = false;
         self.marked_range = None;
+        // Programmatic text starts a fresh history.
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.snapshot = (self.content.clone(), self.selected_range.clone());
         cx.notify();
     }
 
@@ -159,8 +177,45 @@ impl TextField {
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
+        if self.content != self.snapshot.0 {
+            let previous = std::mem::replace(
+                &mut self.snapshot,
+                (self.content.clone(), self.selected_range.clone()),
+            );
+            self.undo_stack.push(previous);
+            if self.undo_stack.len() > 200 {
+                self.undo_stack.remove(0);
+            }
+            self.redo_stack.clear();
+        }
         cx.emit(TextFieldEvent::Changed);
         cx.notify();
+    }
+
+    fn restore(&mut self, state: (SharedString, Range<usize>), cx: &mut Context<Self>) {
+        self.content = state.0;
+        self.selected_range = state.1;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.snapshot = (self.content.clone(), self.selected_range.clone());
+        cx.emit(TextFieldEvent::Changed);
+        cx.notify();
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.undo_stack.pop() {
+            self.redo_stack
+                .push((self.content.clone(), self.selected_range.clone()));
+            self.restore(state, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.redo_stack.pop() {
+            self.undo_stack
+                .push((self.content.clone(), self.selected_range.clone()));
+            self.restore(state, cx);
+        }
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -425,7 +480,14 @@ impl TextField {
     fn previous_word(&self, offset: usize) -> usize {
         let s = &self.content[..offset];
         let trimmed = s.trim_end_matches(Self::is_word_sep);
-        trimmed.rfind(Self::is_word_sep).map(|i| i + 1).unwrap_or(0)
+        // Step past the separator by its UTF-8 length: separators include
+        // multi-byte whitespace (NBSP, U+3000).
+        trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, c)| Self::is_word_sep(*c))
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0)
     }
 
     fn next_word(&self, offset: usize) -> usize {
@@ -509,10 +571,20 @@ impl EntityInputHandler for TextField {
                 .into();
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
+        // The proposed selection is in UTF-16 units *within `new_text`*.
+        let in_new = |utf16: usize| -> usize {
+            let mut units = 0;
+            for (i, c) in new_text.char_indices() {
+                if units >= utf16 {
+                    return i;
+                }
+                units += c.len_utf16();
+            }
+            new_text.len()
+        };
         self.selected_range = new_selected_range_utf16
             .as_ref()
-            .map(|r| self.range_from_utf16(r))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+            .map(|r| range.start + in_new(r.start)..range.start + in_new(r.end))
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.changed(cx);
     }
@@ -782,6 +854,8 @@ impl Render for TextField {
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::complete))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -816,5 +890,45 @@ mod tests {
             f.select_stem(cx);
             assert_eq!(f.selected_range, 0..6);
         });
+    }
+
+    #[gpui::test]
+    fn word_motion_steps_over_multibyte_separators(cx: &mut TestAppContext) {
+        let field = cx.new(|cx| TextField::new("", cx));
+        field.update(cx, |f, cx| {
+            f.set_text("a\u{00A0}b", false, cx);
+            let p = f.previous_word(f.content.len());
+            assert!(f.content.is_char_boundary(p));
+            assert_eq!(&f.content[p..], "b");
+        });
+    }
+
+    #[gpui::test]
+    fn undo_redo_and_ime_selection(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            bind_keys(cx);
+            cx.set_global(crate::theme::Theme::dark());
+        });
+        let (field, cx) = cx.add_window_view(|_, cx| TextField::new("", cx));
+        field.update_in(cx, |f, window, cx| {
+            window.focus(&f.focus_handle);
+            f.set_text("é", false, cx);
+            // IME composes "k" after "é": the marked selection is relative to
+            // the composed text, so the caret lands at the end (byte 3).
+            f.replace_and_mark_text_in_range(None, "k", Some(1..1), window, cx);
+            assert_eq!(f.text(), "ék");
+            assert_eq!(f.selected_range, 3..3);
+            f.unmark_text(window, cx);
+        });
+        cx.simulate_keystrokes("x y");
+        assert_eq!(field.read_with(cx, |f, _| f.text().to_string()), "ékxy");
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(field.read_with(cx, |f, _| f.text().to_string()), "ékx");
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(field.read_with(cx, |f, _| f.text().to_string()), "ék");
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(field.read_with(cx, |f, _| f.text().to_string()), "é");
+        cx.simulate_keystrokes("cmd-shift-z");
+        assert_eq!(field.read_with(cx, |f, _| f.text().to_string()), "ék");
     }
 }

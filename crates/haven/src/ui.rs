@@ -126,3 +126,18 @@ pub fn fallback_icon(is_dir: bool, ext: &str) -> &'static str {
         _ => "file",
     }
 }
+
+/// Single-line text that ends in "…" when it doesn't fit.
+///
+/// Use instead of gpui's `truncate()`: that sets no-wrap, and gpui 0.2.2
+/// caches a no-wrap text's first measurement, which usually has no definite
+/// width yet, so the ellipsis is never applied and long names are just cut
+/// off. A one-line clamp with normal wrapping is re-measured at the real
+/// width.
+pub trait Ellipsis: gpui::Styled + Sized {
+    fn ellipsis(self) -> Self {
+        self.overflow_hidden().line_clamp(1).text_ellipsis()
+    }
+}
+
+impl<T: gpui::Styled> Ellipsis for T {}

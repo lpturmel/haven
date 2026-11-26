@@ -2504,8 +2504,10 @@ dependencies = [
  "haven-core",
  "haven-highlight",
  "haven-macos",
+ "image",
  "nucleo",
  "raw-window-handle",
+ "smallvec",
  "smol",
  "tempfile",
  "unicode-segmentation",
@@ -2528,6 +2530,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "unicode-segmentation",
  "xattr 1.7.0",
 ]
 
@@ -2561,8 +2564,10 @@ version = "0.1.0"
 dependencies = [
  "objc2",
  "objc2-app-kit",
+ "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation",
+ "objc2-image-io",
 ]
 
 [[package]]
@@ -3869,6 +3874,16 @@ dependencies = [
  "bitflags 2.13.2",
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-image-io"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32b0446e98cf4a784cc7a0177715ff317eeaa8463841c616cfc78aa4f953c4ea"
+dependencies = [
+ "objc2-core-foundation",
+ "objc2-core-graphics",
 ]
 
 [[package]]

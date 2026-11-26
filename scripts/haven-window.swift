@@ -1,7 +1,11 @@
 // Helper for scripts/visual-check.sh.
 //
 //   swift scripts/haven-window.swift bounds <pid>
-//       Prints "x,y,w,h" (global points) of the largest on-screen window owned by <pid>.
+//       Prints "id x,y,w,h": the window number and bounds (global points) of the
+//       largest on-screen window owned by <pid>.
+//
+//   swift scripts/haven-window.swift occluded <window-id>
+//       Exits 0 if another app's window above it overlaps it (it is covered), 1 if not.
 //
 //   swift scripts/haven-window.swift luma <png> <x> <y> <w> <h>
 //       Prints the mean WCAG relative luminance (0...1) of a region of <png>, where the
@@ -20,19 +24,55 @@ func bounds(pid: Int32) {
     guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
         as? [[String: Any]]
     else { fail("cannot list windows") }
-    var best: CGRect? = nil
+    var best: (Int, CGRect)? = nil
     for w in list {
         guard (w[kCGWindowOwnerPID as String] as? Int32) == pid,
             (w[kCGWindowLayer as String] as? Int) == 0,
+            let num = w[kCGWindowNumber as String] as? Int,
             let dict = w[kCGWindowBounds as String] as? NSDictionary,
             let rect = CGRect(dictionaryRepresentation: dict)
         else { continue }
-        if best == nil || rect.width * rect.height > best!.width * best!.height {
-            best = rect
+        if best == nil || rect.width * rect.height > best!.1.width * best!.1.height {
+            best = (num, rect)
         }
     }
-    guard let r = best else { fail("no window for pid \(pid)") }
-    print("\(Int(r.minX)),\(Int(r.minY)),\(Int(r.width)),\(Int(r.height))")
+    guard let (num, r) = best else { fail("no window for pid \(pid)") }
+    print("\(num) \(Int(r.minX)),\(Int(r.minY)),\(Int(r.width)),\(Int(r.height))")
+}
+
+func occluded(windowID: Int) -> Bool {
+    guard
+        let all = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
+            as? [[String: Any]],
+        let me = all.first(where: { ($0[kCGWindowNumber as String] as? Int) == windowID }),
+        let myDict = me[kCGWindowBounds as String] as? NSDictionary,
+        let myRect = CGRect(dictionaryRepresentation: myDict),
+        let myPid = me[kCGWindowOwnerPID as String] as? Int32,
+        let above = CGWindowListCopyWindowInfo(
+            [.optionOnScreenAboveWindow], CGWindowID(windowID)) as? [[String: Any]]
+    else { return false }
+    // Any visible window above Haven counts (app windows, permission
+    // prompts, notifications, alerts), except system furniture that sits
+    // above everything without covering app content.
+    let furniture: Set<String> = [
+        "Window Server", "Dock", "SystemUIServer", "Control Center", "WindowManager",
+        "TextInputMenuAgent",
+    ]
+    return above.contains { w in
+        guard (w[kCGWindowOwnerPID as String] as? Int32) != myPid,
+            !furniture.contains(w[kCGWindowOwnerName as String] as? String ?? ""),
+            // 24/25: the menu bar and its status items (owned by many apps).
+            ![24, 25].contains(w[kCGWindowLayer as String] as? Int ?? 0),
+            (w[kCGWindowLayer as String] as? Int ?? 0) < 1000,
+            (w[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+            // Notification Center's full-screen container (banners are
+            // separate windows and still count).
+            (w[kCGWindowName as String] as? String) != "Notification Center",
+            let d = w[kCGWindowBounds as String] as? NSDictionary,
+            let r = CGRect(dictionaryRepresentation: d)
+        else { return false }
+        return r.intersects(myRect)
+    }
 }
 
 func linear(_ c: Double) -> Double {
@@ -77,10 +117,12 @@ guard args.count >= 2 else { fail("usage: bounds <pid> | luma <png> <x> <y> <w> 
 switch args[1] {
 case "bounds" where args.count == 3:
     bounds(pid: Int32(args[2]) ?? 0)
+case "occluded" where args.count == 3:
+    exit(occluded(windowID: Int(args[2]) ?? 0) ? 0 : 1)
 case "luma" where args.count == 7:
     luma(
         path: args[2], fx: Double(args[3])!, fy: Double(args[4])!, fw: Double(args[5])!,
         fh: Double(args[6])!)
 default:
-    fail("usage: bounds <pid> | luma <png> <x> <y> <w> <h>")
+    fail("usage: bounds <pid> | occluded <window-id> | luma <png> <x> <y> <w> <h>")
 }

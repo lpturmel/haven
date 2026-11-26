@@ -17,6 +17,7 @@ use crate::actions::NavigateTo;
 use crate::store::Store;
 use crate::tab::{DraggedFiles, Location, Tab};
 use crate::theme::theme;
+use crate::ui::Ellipsis as _;
 use crate::ui::{icon, icon_button, tag_dot};
 
 /// Drives and recents, refreshed by the workspace.
@@ -24,7 +25,11 @@ use crate::ui::{icon, icon_button, tag_dot};
 pub struct StartData {
     pub volumes: Vec<Volume>,
     pub recents: Vec<Recent>,
+    /// Metadata for the recents shown (stat'ed in the background, not per render).
+    pub recent_entries: Vec<Option<Entry>>,
     pub recents_loaded: Option<Instant>,
+    /// Sidebar places that exist (checked in the background).
+    pub places: Option<Vec<(String, PathBuf, &'static str)>>,
     pub pinned: Vec<Entry>,
 }
 
@@ -103,7 +108,7 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                         }))
                         .child(
                             div()
-                                .truncate()
+                                .ellipsis()
                                 .text_size(px(12.))
                                 .text_color(t.text)
                                 .child(e.name.clone()),
@@ -120,6 +125,8 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                             cx.listener(move |_, _, _, cx| {
                                 cx.stop_propagation();
                                 Store::update(cx, |s| s.toggle_start_pin(&unpin));
+                                // The tiles come from StartData, not the store.
+                                crate::workspace::refresh_pins(cx);
                                 cx.notify();
                             }),
                         )),
@@ -164,7 +171,7 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                             .gap(px(4.))
                             .child(
                                 div()
-                                    .truncate()
+                                    .ellipsis()
                                     .text_size(px(13.))
                                     .text_color(t.text)
                                     .child(v.name.clone()),
@@ -201,7 +208,7 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
         .map(|(i, r)| {
             let path = r.path.clone();
             let open = r.path.clone();
-            let entry = Entry::from_path(&r.path).ok();
+            let entry = start_data(cx).recent_entries.get(i).cloned().flatten();
             let parent = r.path.parent().map(tildify).unwrap_or_default();
             div()
                 .id(("recent", i))
@@ -215,12 +222,15 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
+                    // A click opens the file (the first click used to navigate
+                    // away, so the double-click branch could never run);
+                    // ⌘-click or a click on the folder path reveals it.
                     cx.listener(move |_, ev: &MouseDownEvent, window, cx| {
-                        if ev.click_count >= 2 {
+                        if ev.modifiers.platform {
+                            window.dispatch_action(Box::new(NavigateTo(path.clone())), cx);
+                        } else if ev.click_count == 1 {
                             cx.open_with_system(&open);
                             Store::update(cx, |s| s.record_opened(&open));
-                        } else {
-                            window.dispatch_action(Box::new(NavigateTo(path.clone())), cx);
                         }
                     }),
                 )
@@ -229,7 +239,7 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
+                        .ellipsis()
                         .text_size(px(13.))
                         .text_color(t.text)
                         .child(
@@ -241,6 +251,7 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                 )
                 .child(
                     div()
+                        .id(("recent-reveal", i))
                         .w(px(300.))
                         .flex_none()
                         .min_w_0()
@@ -249,6 +260,14 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                         .text_ellipsis()
                         .text_size(px(12.))
                         .text_color(t.text_muted)
+                        .hover(|s| s.text_color(t.text))
+                        .on_mouse_down(MouseButton::Left, {
+                            let reveal = r.path.clone();
+                            move |_, window, cx| {
+                                cx.stop_propagation();
+                                window.dispatch_action(Box::new(NavigateTo(reveal.clone())), cx);
+                            }
+                        })
                         .child(parent),
                 )
                 .child(

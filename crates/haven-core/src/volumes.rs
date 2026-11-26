@@ -106,10 +106,24 @@ pub fn available_space(path: &Path) -> Option<u64> {
     Some(st.f_bavail * st.f_bsize as u64)
 }
 
-/// Ejects a volume via `diskutil` (blocking).
+fn is_local(mount: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()) else {
+        return true;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string and `st` is a writable statfs.
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return true;
+    }
+    st.f_flags & libc::MNT_LOCAL as u32 != 0
+}
+
+/// Ejects a volume via `diskutil` (blocking). Network shares (SMB, AFP,
+/// NFS) have no disk device to eject, so they are unmounted instead.
 pub fn eject(mount: &Path) -> Result<(), String> {
+    let verb = if is_local(mount) { "eject" } else { "unmount" };
     let out = Command::new("/usr/sbin/diskutil")
-        .arg("eject")
+        .arg(verb)
         .arg(mount)
         .output()
         .map_err(|e| e.to_string())?;

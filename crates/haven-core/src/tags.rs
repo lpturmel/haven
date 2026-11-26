@@ -157,8 +157,13 @@ pub fn set_tag(paths: &[PathBuf], tag: &Tag, on: bool) -> io::Result<()> {
 
 /// Finds every file carrying `name` using Spotlight.
 pub fn search_tag(name: &str) -> Vec<PathBuf> {
-    let escaped = name.replace('\\', "\\\\").replace('\'', "\\'");
-    let query = format!("kMDItemUserTags == '{escaped}'");
+    // Finder tag names are case-insensitive (`c`), and `*` is a wildcard in
+    // Spotlight queries, so escape it along with quotes and backslashes.
+    let escaped = name
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('*', "\\*");
+    let query = format!("kMDItemUserTags == '{escaped}'c");
     let Ok(out) = Command::new("/usr/bin/mdfind")
         .arg("-0")
         .arg(query)

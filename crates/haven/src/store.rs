@@ -27,13 +27,14 @@ impl Store {
                     .await;
                 let snapshot = cx
                     .update(|cx| {
-                        let store = cx.global_mut::<Store>();
-                        if store.dirty {
-                            store.dirty = false;
-                            Some(store.state.clone())
-                        } else {
-                            None
+                        // Only touch the global mutably when there is work:
+                        // `global_mut` notifies observers (a full re-render).
+                        if !cx.global::<Store>().dirty {
+                            return None;
                         }
+                        let store = cx.global_mut::<Store>();
+                        store.dirty = false;
+                        Some(store.state.clone())
                     })
                     .ok()
                     .flatten();

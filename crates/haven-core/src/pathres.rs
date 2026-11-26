@@ -98,15 +98,25 @@ fn expand_vars(input: &str) -> Result<String, String> {
                 break;
             }
         }
-        if braced && chars.next() != Some('}') {
-            return Err("Unclosed ${…}".into());
+        let closed = !braced || chars.peek() == Some(&'}');
+        if braced && closed {
+            chars.next();
         }
-        if name.is_empty() {
-            out.push('$');
-            continue;
+        // `$` is legal in file names (`$RECYCLE.BIN`, `C$`): anything that is
+        // not a set variable stays literal and resolves as a path.
+        match std::env::var(&name) {
+            Ok(value) if !name.is_empty() && closed => out.push_str(&value),
+            _ => {
+                out.push('$');
+                if braced {
+                    out.push('{');
+                }
+                out.push_str(&name);
+                if braced && closed {
+                    out.push('}');
+                }
+            }
         }
-        let value = std::env::var(&name).map_err(|_| format!("${name} is not set"))?;
-        out.push_str(&value);
     }
     Ok(out)
 }
@@ -116,11 +126,15 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // Work on bytes: slicing the `&str` could split a UTF-8 character
+        // (e.g. `%aé`) and panic.
         if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+            )
         {
-            out.push(b);
+            out.push((hi * 16 + lo) as u8);
             i += 3;
             continue;
         }
@@ -156,7 +170,19 @@ mod tests {
             expand("/../..", Path::new("/")).unwrap(),
             PathBuf::from("/")
         );
-        assert!(expand("$HAVEN_DEFINITELY_UNSET_VAR", Path::new("/")).is_err());
+        // Unset variables and stray `$` stay literal: `$` is legal in names.
+        assert_eq!(
+            expand("/Volumes/USB/$RECYCLE.BIN", Path::new("/")).unwrap(),
+            PathBuf::from("/Volumes/USB/$RECYCLE.BIN")
+        );
+        assert_eq!(
+            expand("/x/${HAVEN_DEFINITELY_UNSET_VAR}/C$", Path::new("/")).unwrap(),
+            PathBuf::from("/x/${HAVEN_DEFINITELY_UNSET_VAR}/C$")
+        );
+        assert_eq!(
+            expand("/x/${unclosed", Path::new("/")).unwrap(),
+            PathBuf::from("/x/${unclosed")
+        );
         assert!(expand("   ", Path::new("/")).is_err());
     }
 
@@ -165,6 +191,15 @@ mod tests {
         assert_eq!(
             expand("file:///tmp/My%20Folder", Path::new("/")).unwrap(),
             PathBuf::from("/tmp/My Folder")
+        );
+        // A `%` followed by a multi-byte character must not panic.
+        assert_eq!(
+            expand("file:///tmp/%aé/x", Path::new("/")).unwrap(),
+            PathBuf::from("/tmp/%aé/x")
+        );
+        assert_eq!(
+            expand("file:///tmp/caf%C3%A9%", Path::new("/")).unwrap(),
+            PathBuf::from("/tmp/café%")
         );
     }
 

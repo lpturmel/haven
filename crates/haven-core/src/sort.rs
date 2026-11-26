@@ -101,7 +101,9 @@ impl SortSpec {
 }
 
 /// Builds a key that sorts naturally ("file2" < "file10") and case-insensitively
-/// under plain byte comparison: digit runs are left-padded to 20 characters.
+/// under plain byte comparison: each digit run (leading zeros dropped) is
+/// prefixed with its length, so longer numbers sort after shorter ones at any
+/// size.
 pub fn natural_key(name: &str) -> String {
     let lower = name.to_lowercase();
     let mut out = String::with_capacity(lower.len() + 8);
@@ -110,9 +112,7 @@ pub fn natural_key(name: &str) -> String {
         if !digits.is_empty() {
             let trimmed = digits.trim_start_matches('0');
             let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
-            for _ in trimmed.len()..20 {
-                out.push('0');
-            }
+            out.push_str(&format!("{:04}", trimmed.len().min(9999)));
             out.push_str(trimmed);
             digits.clear();
         }
@@ -279,5 +279,11 @@ mod tests {
     fn natural_key_pads_digits() {
         assert!(natural_key("v2") < natural_key("v10"));
         assert!(natural_key("img007") == natural_key("IMG7"));
+        // Runs longer than any fixed padding still compare numerically.
+        let long = format!("x1{}", "0".repeat(20)); // 21 digits
+        let shorter = format!("x{}", "9".repeat(20)); // 20 digits
+        assert!(natural_key(&shorter) < natural_key(&long));
+        assert!(natural_key("a9") < natural_key("a10"));
+        assert!(natural_key("a") < natural_key("a1"));
     }
 }

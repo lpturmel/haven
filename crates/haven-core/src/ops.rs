@@ -115,10 +115,18 @@ impl Undo {
             Undo::Created(v) => format!("Undid create ({})", plural(v.len())),
             Undo::Moved(v) => format!("Undid move ({})", plural(v.len())),
             Undo::Trashed(v) => format!("Restored from Trash ({})", plural(v.len())),
-            Undo::Batch(steps) => steps
-                .last()
-                .map(Undo::describe)
-                .unwrap_or_else(|| "Undid".into()),
+            // A Replace conflict is recorded as [trashed originals, new items].
+            Undo::Batch(steps) => match steps.as_slice() {
+                [Undo::Trashed(old), Undo::Created(_) | Undo::Moved(_)] if !old.is_empty() => {
+                    format!("Undid replace ({})", plural(old.len()))
+                }
+                _ => steps
+                    .iter()
+                    .rev()
+                    .find(|s| !s.is_empty())
+                    .map(Undo::describe)
+                    .unwrap_or_else(|| "Undid".into()),
+            },
         }
     }
 
@@ -135,57 +143,123 @@ impl Undo {
     /// Reverses the operation. Returns the inverse so it can be redone.
     pub fn apply(&self) -> io::Result<Undo> {
         match self {
+            // Every variant is all-or-nothing: on failure, whatever was already
+            // reversed is put back, so the record stays valid to retry.
             Undo::Created(paths) => {
-                let mut trashed = Vec::new();
+                let mut trashed: Vec<(PathBuf, PathBuf)> = Vec::new();
                 for p in paths {
-                    let landed = haven_macos::trash(p).map_err(io::Error::other)?;
-                    trashed.push((p.clone(), landed));
+                    match haven_macos::trash(p) {
+                        Ok(landed) => trashed.push((p.clone(), landed)),
+                        Err(e) => {
+                            for (orig, landed) in trashed.iter().rev() {
+                                let _ = fs::rename(landed, orig);
+                            }
+                            return Err(io::Error::other(e));
+                        }
+                    }
                 }
                 Ok(Undo::Trashed(trashed))
             }
-            Undo::Moved(pairs) => {
-                let mut back = Vec::new();
-                for (from, to) in pairs.iter().rev() {
-                    // After a case-only rename on a case-insensitive volume,
-                    // `from` "exists" because it is the same file as `to`.
-                    let same = match (fs::symlink_metadata(from), fs::symlink_metadata(to)) {
-                        (Ok(a), Ok(b)) => same_file(&a, &b),
-                        _ => false,
-                    };
-                    if from.exists() && !same {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            format!("{} already exists", from.display()),
-                        ));
-                    }
-                    move_path(to, from)?;
-                    back.push((to.clone(), from.clone()));
-                }
-                Ok(Undo::Moved(back))
-            }
+            Undo::Moved(pairs) => undo_moves(pairs),
             Undo::Trashed(pairs) => {
-                let mut restored = Vec::new();
-                for (orig, landed) in pairs {
-                    if orig.exists() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            format!("{} already exists", orig.display()),
-                        ));
-                    }
-                    fs::rename(landed, orig)?;
-                    restored.push(orig.clone());
+                if let Some((orig, _)) = pairs.iter().find(|(orig, _)| orig.exists()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} already exists", orig.display()),
+                    ));
                 }
-                Ok(Undo::Created(restored))
+                let mut restored: Vec<(PathBuf, PathBuf)> = Vec::new();
+                for (orig, landed) in pairs {
+                    if let Err(e) = fs::rename(landed, orig) {
+                        for (orig, landed) in restored.iter().rev() {
+                            let _ = fs::rename(orig, landed);
+                        }
+                        return Err(e);
+                    }
+                    restored.push((orig.clone(), landed.clone()));
+                }
+                Ok(Undo::Created(
+                    restored.into_iter().map(|(o, _)| o).collect(),
+                ))
             }
             Undo::Batch(steps) => {
-                let mut inverse = Vec::new();
+                let mut inverse: Vec<Undo> = Vec::new();
                 for step in steps.iter().rev() {
-                    inverse.push(step.apply()?);
+                    match step.apply() {
+                        Ok(inv) => inverse.push(inv),
+                        Err(e) => {
+                            // Redo the steps already undone, newest first.
+                            for inv in inverse.iter().rev() {
+                                let _ = inv.apply();
+                            }
+                            return Err(e);
+                        }
+                    }
                 }
                 Ok(Undo::Batch(inverse))
             }
         }
     }
+}
+
+/// A hidden temporary name unique across this process: concurrent operations
+/// (two undos, an undo and a bulk rename) must never pick the same one, since
+/// `rename` silently replaces an existing file.
+fn temp_name(kind: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(".haven-{kind}-{}-{n}", std::process::id())
+}
+
+/// Reverses `(from, to)` moves: everything at `to` goes back to `from`.
+///
+/// Two-phase through temporary names, so overlapping records (a bulk rename
+/// `f 1 -> f 2, f 2 -> f 3`, or a swap) undo cleanly. A `from` is only a
+/// conflict if something else occupies it: another entry's `to` that is about
+/// to move away, or the same file (case-only rename), is fine.
+fn undo_moves(pairs: &[(PathBuf, PathBuf)]) -> io::Result<Undo> {
+    let leaving: std::collections::HashSet<&PathBuf> = pairs.iter().map(|(_, to)| to).collect();
+    for (from, to) in pairs {
+        let same = match (fs::symlink_metadata(from), fs::symlink_metadata(to)) {
+            (Ok(a), Ok(b)) => same_file(&a, &b),
+            _ => false,
+        };
+        if fs::symlink_metadata(from).is_ok() && !same && !leaving.contains(from) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", from.display()),
+            ));
+        }
+    }
+    let temps: Vec<PathBuf> = pairs
+        .iter()
+        .map(|(_, to)| to.with_file_name(temp_name("undo")))
+        .collect();
+    for (i, ((_, to), tmp)) in pairs.iter().zip(&temps).enumerate() {
+        if let Err(e) = fs::rename(to, tmp) {
+            for j in (0..i).rev() {
+                let _ = fs::rename(&temps[j], &pairs[j].1);
+            }
+            return Err(e);
+        }
+    }
+    for (i, ((from, _), tmp)) in pairs.iter().zip(&temps).enumerate() {
+        if let Err(e) = move_path(tmp, from, &Progress::default()) {
+            for j in (0..i).rev() {
+                let _ = move_path(&pairs[j].0, &temps[j], &Progress::default());
+            }
+            for j in 0..pairs.len() {
+                let _ = fs::rename(&temps[j], &pairs[j].1);
+            }
+            return Err(e);
+        }
+    }
+    Ok(Undo::Moved(
+        pairs
+            .iter()
+            .map(|(from, to)| (to.clone(), from.clone()))
+            .collect(),
+    ))
 }
 
 /// Finder-style "keep both" name: `name copy.ext`, `name copy 2.ext`, ...
@@ -235,7 +309,8 @@ fn tree_size(path: &Path) -> (u64, u64) {
         return (meta.len(), 1);
     }
     let mut bytes = 0;
-    let mut items = 1;
+    // jwalk yields the root itself, so it is counted by the loop.
+    let mut items = 0;
     for e in jwalk::WalkDir::new(path)
         .skip_hidden(false)
         .follow_links(false)
@@ -286,12 +361,17 @@ fn remove_any(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Moves `from` to `to`, falling back to copy+delete across volumes.
-pub fn move_path(from: &Path, to: &Path) -> io::Result<()> {
+/// Moves `from` to `to`, falling back to copy+delete across volumes. A failed
+/// or cancelled cross-volume copy removes its partial output and leaves
+/// `from` untouched.
+pub fn move_path(from: &Path, to: &Path, progress: &Progress) -> io::Result<()> {
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-            copy_tree(from, to, &Progress::default())?;
+            if let Err(e) = copy_tree(from, to, progress) {
+                let _ = remove_any(to);
+                return Err(e);
+            }
             remove_any(from)
         }
         Err(e) => Err(e),
@@ -321,6 +401,9 @@ pub fn transfer(
     let mut replaced = Vec::new();
     let result = (|| {
         for src in sources {
+            if progress.cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
             let Some(name) = src.file_name() else {
                 continue;
             };
@@ -333,7 +416,9 @@ pub fn transfer(
                 match policy {
                     Conflict::Skip if !same => continue,
                     Conflict::Replace if !same => {
-                        if dest.starts_with(src) {
+                        // Never trash the source itself or a folder holding it
+                        // (moving `/x/a/a` into `/x` would trash `/x/a`).
+                        if dest.starts_with(src) || src.starts_with(&target) {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
                                 "cannot replace a folder with itself",
@@ -356,12 +441,17 @@ pub fn transfer(
             }
             match kind {
                 OpKind::Copy => {
-                    copy_tree(src, &target, progress)?;
+                    if let Err(e) = copy_tree(src, &target, progress) {
+                        // The partial copy is ours (the target was free or
+                        // already trashed): don't leave it behind.
+                        let _ = remove_any(&target);
+                        return Err(e);
+                    }
                     created.push(target);
                 }
                 OpKind::Move => {
                     progress.set_current(src);
-                    move_path(src, &target)?;
+                    move_path(src, &target, progress)?;
                     let (b, i) = tree_size(&target);
                     progress.done_bytes.fetch_add(b, Ordering::Relaxed);
                     progress.done_items.fetch_add(i, Ordering::Relaxed);
@@ -557,7 +647,13 @@ impl BulkRename {
                     format!("two items would be named “{n}”"),
                 ));
             }
-            if t != *p && !paths.contains(&t) && fs::symlink_metadata(&t).is_ok() {
+            // On a case-insensitive volume a case change "exists" as the
+            // same file: that is not a clash.
+            let same = match (fs::symlink_metadata(&t), fs::symlink_metadata(p)) {
+                (Ok(a), Ok(b)) => same_file(&a, &b),
+                _ => false,
+            };
+            if t != *p && !same && !paths.contains(&t) && fs::symlink_metadata(&t).is_ok() {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!("“{n}” already exists"),
@@ -582,8 +678,7 @@ impl BulkRename {
     ) -> io::Result<Undo> {
         let temps: Vec<PathBuf> = paths
             .iter()
-            .enumerate()
-            .map(|(i, p)| p.with_file_name(format!(".haven-rename-{}-{i}", std::process::id())))
+            .map(|p| p.with_file_name(temp_name("rename")))
             .collect();
         for (i, (p, tmp)) in paths.iter().zip(&temps).enumerate() {
             if let Err(e) = rename(p, tmp) {
@@ -803,6 +898,7 @@ mod tests {
         };
         assert_eq!(fs::read(root.join("d/a.txt")).unwrap(), b"new");
         assert!(matches!(undo, Undo::Batch(_)));
+        assert_eq!(undo.describe(), "Undid replace (1 item)");
         undo.apply().unwrap();
         assert_eq!(fs::read(root.join("d/a.txt")).unwrap(), b"old");
     }
@@ -910,5 +1006,175 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["a.txt"]);
+    }
+
+    #[test]
+    fn undo_of_swapped_and_chained_moves() {
+        let (_d, root) = setup();
+        let p = |n: &str| root.join(n);
+        // A swap a <-> b already happened: b holds A, a holds B.
+        fs::write(p("b.txt"), b"A").unwrap();
+        fs::write(p("a.txt"), b"B").unwrap();
+        let swap = Undo::Moved(vec![(p("a.txt"), p("b.txt")), (p("b.txt"), p("a.txt"))]);
+        let redo = swap.apply().unwrap();
+        assert_eq!(fs::read(p("a.txt")).unwrap(), b"A");
+        assert_eq!(fs::read(p("b.txt")).unwrap(), b"B");
+        redo.apply().unwrap();
+        assert_eq!(fs::read(p("a.txt")).unwrap(), b"B");
+        // A shifting rename f1 -> f2, f2 -> f3.
+        fs::write(p("f2"), b"1").unwrap();
+        fs::write(p("f3"), b"2").unwrap();
+        Undo::Moved(vec![(p("f1"), p("f2")), (p("f2"), p("f3"))])
+            .apply()
+            .unwrap();
+        assert_eq!(fs::read(p("f1")).unwrap(), b"1");
+        assert_eq!(fs::read(p("f2")).unwrap(), b"2");
+        assert!(!p("f3").exists());
+    }
+
+    #[test]
+    fn failed_undo_changes_nothing() {
+        let (_d, root) = setup();
+        let p = |n: &str| root.join(n);
+        fs::write(p("moved-1"), b"1").unwrap();
+        fs::write(p("moved-2"), b"2").unwrap();
+        fs::write(p("orig-2"), b"someone else").unwrap();
+        let undo = Undo::Moved(vec![
+            (p("orig-1"), p("moved-1")),
+            (p("orig-2"), p("moved-2")),
+        ]);
+        assert!(undo.apply().is_err());
+        assert!(p("moved-1").exists() && !p("orig-1").exists());
+        assert_eq!(fs::read(p("orig-2")).unwrap(), b"someone else");
+        // Trashed: one original is occupied -> nothing is restored.
+        fs::write(p("t1"), b"t1").unwrap();
+        fs::write(p("t2"), b"t2").unwrap();
+        let trashed = Undo::Trashed(vec![(p("orig-a"), p("t1")), (p("orig-2"), p("t2"))]);
+        assert!(trashed.apply().is_err());
+        assert!(p("t1").exists() && !p("orig-a").exists());
+    }
+
+    #[test]
+    fn bulk_rename_can_change_case() {
+        let (_d, root) = setup();
+        fs::write(root.join("photo.jpg"), b"").unwrap();
+        let spec = BulkRename {
+            case: CaseChange::Upper,
+            ..Default::default()
+        };
+        let undo = spec.apply(&[root.join("photo.jpg")]).unwrap();
+        let names: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["PHOTO.jpg"]);
+        undo.apply().unwrap();
+        assert!(
+            fs::read_dir(&root)
+                .unwrap()
+                .any(|e| e.unwrap().file_name() == "photo.jpg")
+        );
+    }
+
+    #[test]
+    fn replace_never_trashes_a_folder_holding_the_source() {
+        let (_d, root) = setup();
+        fs::create_dir_all(root.join("a/a")).unwrap();
+        fs::write(root.join("a/a/keep.txt"), b"k").unwrap();
+        let out = transfer(
+            OpKind::Move,
+            &[root.join("a/a")],
+            &root,
+            Conflict::Replace,
+            &Progress::default(),
+        );
+        assert!(out.is_err());
+        assert_eq!(fs::read(root.join("a/a/keep.txt")).unwrap(), b"k");
+    }
+
+    #[test]
+    fn failed_copy_leaves_no_partial_output() {
+        let (_d, root) = setup();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/ok.txt"), b"ok").unwrap();
+        fs::write(root.join("src/locked.txt"), b"no").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            root.join("src/locked.txt"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        fs::create_dir(root.join("dst")).unwrap();
+        let out = transfer(
+            OpKind::Copy,
+            &[root.join("src")],
+            &root.join("dst"),
+            Conflict::KeepBoth,
+            &Progress::default(),
+        );
+        fs::set_permissions(
+            root.join("src/locked.txt"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(out.is_err());
+        assert!(!root.join("dst/src").exists());
+    }
+
+    #[test]
+    fn cancelled_transfer_does_nothing_and_progress_totals_match() {
+        let (_d, root) = setup();
+        fs::create_dir_all(root.join("tree/sub")).unwrap();
+        for n in ["tree/a", "tree/b", "tree/sub/c"] {
+            fs::write(root.join(n), b"").unwrap();
+        }
+        fs::create_dir(root.join("dst")).unwrap();
+        let p = Progress::new();
+        p.cancel.store(true, Ordering::Relaxed);
+        let out = transfer(
+            OpKind::Move,
+            &[root.join("tree")],
+            &root.join("dst"),
+            Conflict::KeepBoth,
+            &p,
+        );
+        assert!(out.is_err());
+        assert!(root.join("tree").exists() && !root.join("dst/tree").exists());
+        // Empty files: progress is item-based and must reach 100%.
+        let p = Progress::new();
+        transfer(
+            OpKind::Copy,
+            &[root.join("tree")],
+            &root.join("dst"),
+            Conflict::KeepBoth,
+            &p,
+        )
+        .unwrap();
+        assert_eq!(p.total_items.load(Ordering::Relaxed), 5);
+        assert!((p.fraction() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn concurrent_undos_in_one_folder_never_clobber_each_other() {
+        let (_d, root) = setup();
+        let mut records = Vec::new();
+        for i in 0..16 {
+            fs::write(root.join(format!("moved-{i}")), format!("{i}")).unwrap();
+            records.push(Undo::Moved(vec![(
+                root.join(format!("orig-{i}")),
+                root.join(format!("moved-{i}")),
+            )]));
+        }
+        std::thread::scope(|s| {
+            for r in &records {
+                s.spawn(move || r.apply().unwrap());
+            }
+        });
+        for i in 0..16 {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("orig-{i}"))).unwrap(),
+                format!("{i}")
+            );
+        }
     }
 }

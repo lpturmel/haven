@@ -28,6 +28,7 @@ actions!(
         GoHomeFolder,
         Refresh,
         UndoOp,
+        SpaceKey,
         CopyPath,
         NewFolder,
         PasteFiles,
@@ -63,6 +64,7 @@ actions!(
         MakeDefaultViewer,
         RestoreFinder,
         Dismiss,
+        ConfirmModal,
     ]
 );
 
@@ -120,6 +122,9 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("escape", Dismiss, ws),
+        // Enter takes the primary button of the conflict / confirm dialogs
+        // (they hold focus on the workspace, so the file view's Enter is out).
+        KeyBinding::new("enter", ConfirmModal, ws),
         KeyBinding::new("cmd-t", NewTab, ws),
         KeyBinding::new("cmd-w", CloseTab, ws),
         KeyBinding::new("cmd-shift-t", ReopenClosedTab, ws),
@@ -191,7 +196,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-t", EditTags, fv),
         KeyBinding::new("cmd-ctrl-t", PinToSidebar, fv),
         KeyBinding::new("cmd-i", GetInfo, fv),
-        KeyBinding::new("space", TogglePreview, fv),
+        // Space continues a type-to-select in progress, else toggles preview.
+        KeyBinding::new("space", SpaceKey, fv),
         KeyBinding::new("cmd-alt-r", RevealSelected, fv),
     ]);
 }

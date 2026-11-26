@@ -3,14 +3,15 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
     Context, EventEmitter, FocusHandle, Font, Hsla, Modifiers, Pixels, Point, ScrollStrategy,
     SharedString, Task, TextRun, UniformListScrollHandle, Window, font,
 };
 use haven_core::dirsize::{self, Control};
-use haven_core::kind::is_image_ext;
+use haven_core::kind::{is_image_ext, is_native_image_ext};
 use haven_core::sort::{self, SortKey, SortSpec};
 use haven_core::state::{FolderPrefs, ViewMode};
 use haven_core::{Entry, list_dir, tags};
@@ -80,6 +81,9 @@ pub struct TextPreview {
     pub lang: Option<&'static str>,
     pub truncated: bool,
     pub bytes: u64,
+    /// The file's size and mtime when it was read, to notice in-place edits.
+    pub file_size: u64,
+    pub file_modified: Option<SystemTime>,
 }
 
 pub enum Preview {
@@ -103,6 +107,12 @@ pub struct Tab {
     pub cursor: Option<usize>,
     anchor: Option<usize>,
     pending_collapse: Option<usize>,
+    /// Path under the first click of a potential double-click. A second
+    /// click only opens if the same item is still under it.
+    click_origin: Option<PathBuf>,
+    /// Set once a double-click opened something; the rest of that click
+    /// gesture (count >= 2) is ignored until a fresh single click.
+    click_consumed: bool,
     pub view: ViewMode,
     pub sort: SortSpec,
     pub loading: bool,
@@ -116,10 +126,12 @@ pub struct Tab {
     type_buffer: String,
     type_at: Instant,
     pub preview: Preview,
-    preview_task: Option<Task<()>>,
+    preview_task: Option<PreviewJob>,
     pub column_root: Option<PathBuf>,
     pub column_cache: HashMap<PathBuf, Arc<Vec<Entry>>>,
     column_loading: HashSet<PathBuf>,
+    /// Columns whose folder couldn't be listed (e.g. permission denied).
+    pub column_errors: HashMap<PathBuf, String>,
     pub free_space: Option<u64>,
     size_control: Option<Arc<Control>>,
     pub sizing: bool,
@@ -141,6 +153,8 @@ impl Tab {
             cursor: None,
             anchor: None,
             pending_collapse: None,
+            click_origin: None,
+            click_consumed: false,
             view: Store::get(cx).default_view,
             sort: Store::get(cx).default_sort.clone(),
             loading: false,
@@ -158,6 +172,7 @@ impl Tab {
             column_root: None,
             column_cache: HashMap::new(),
             column_loading: HashSet::new(),
+            column_errors: HashMap::new(),
             free_space: None,
             size_control: None,
             sizing: false,
@@ -232,6 +247,9 @@ impl Tab {
         self.preview = Preview::None;
         self.error = None;
         self.pending_select.clear();
+        self.click_origin = None;
+        // A preview still loading for the old folder must not land here.
+        self.preview_task = None;
         if let Some(dir) = self.dir().map(Path::to_path_buf) {
             let prefs = Store::get(cx).prefs_for(&dir);
             self.view = prefs.view;
@@ -428,6 +446,9 @@ impl Tab {
         let first_wanted = self.pending_select.first().cloned();
         self.pending_select.clear();
         if ixs.is_empty() {
+            // The selected items are gone (deleted or renamed elsewhere):
+            // drop their preview too.
+            self.update_preview(cx);
             return;
         }
         self.selection = ixs.iter().copied().collect();
@@ -458,6 +479,7 @@ impl Tab {
         };
         self.selection.clear();
         self.cursor = None;
+        self.anchor = None;
         self.pending_select = selected;
         if self.pending_select.is_empty() && !self.filter.is_empty() && !self.entries.is_empty() {
             self.select_only(0, cx);
@@ -644,6 +666,7 @@ impl Tab {
         self.cursor = None;
         self.anchor = None;
         self.preview = Preview::None;
+        self.preview_task = None;
         cx.notify();
     }
 
@@ -667,6 +690,36 @@ impl Tab {
         } else {
             self.select_only(next, cx)
         }
+    }
+
+    /// Rows per Page Up/Down: 20 list rows, or a few grid rows.
+    pub fn page_rows(&self) -> isize {
+        if self.view == ViewMode::Grid { 4 } else { 20 }
+    }
+
+    /// Moves the cursor by `rows` rows: one item in list views, a whole row
+    /// of `grid_cols` items in the grid. In the grid, moving up from the
+    /// first row stays put, and moving down into a shorter last row lands
+    /// on its last item (Finder's behaviour).
+    pub fn move_rows(&mut self, rows: isize, extend: bool, cx: &mut Context<Self>) {
+        if self.view != ViewMode::Grid {
+            return self.move_cursor(rows, extend, cx);
+        }
+        let len = self.entries.len() as isize;
+        let cols = self.grid_cols.max(1) as isize;
+        let Some(c) = self.cursor.map(|c| c as isize) else {
+            return self.move_cursor(rows, extend, cx);
+        };
+        if len == 0 {
+            return;
+        }
+        let last_row = (len - 1) / cols;
+        let target_row = (c / cols + rows).clamp(0, last_row);
+        if target_row == c / cols {
+            return; // already on the first/last row
+        }
+        let target = (target_row * cols + c % cols).min(len - 1);
+        self.move_cursor(target - c, extend, cx);
     }
 
     pub fn move_to_edge(&mut self, end: bool, cx: &mut Context<Self>) {
@@ -702,11 +755,28 @@ impl Tab {
             self.context_item(ix, position, window, cx);
             return;
         }
+        let path = self.entries.get(ix).map(|e| e.path.clone());
         if click_count >= 2 {
-            self.select_only(ix, cx);
-            self.open_selected(window, cx);
-            return;
+            // After a double-click opened something (e.g. navigated into a
+            // folder), the gesture's remaining clicks must not act on whatever
+            // now sits under the pointer.
+            if self.click_consumed {
+                return;
+            }
+            // Only open what the first click selected.
+            if path.is_some() && self.click_origin == path {
+                self.click_consumed = true;
+                self.click_origin = None;
+                self.select_only(ix, cx);
+                self.open_selected(window, cx);
+                return;
+            }
+            // A quick click on a different item (e.g. a shift-click right after
+            // a click elsewhere): handle it as a normal click below.
+        } else {
+            self.click_consumed = false;
         }
+        self.click_origin = path;
         if modifiers.platform {
             self.toggle_select(ix, cx);
         } else if modifiers.shift {
@@ -857,15 +927,27 @@ impl Tab {
             let task = cx.background_executor().spawn({
                 let dir = dir.clone();
                 async move {
-                    let mut e = list_dir(&dir, show_hidden).unwrap_or_default();
-                    sort::sort_entries(&mut e, &sort);
-                    e
+                    list_dir(&dir, show_hidden).map(|mut e| {
+                        sort::sort_entries(&mut e, &sort);
+                        e
+                    })
                 }
             });
             cx.spawn(async move |this, cx| {
-                let entries = task.await;
+                let listed = task.await;
                 let _ = this.update(cx, |tab, cx| {
                     tab.column_loading.remove(&dir);
+                    // An unreadable folder must say so, not look empty.
+                    let entries = match listed {
+                        Ok(e) => {
+                            tab.column_errors.remove(&dir);
+                            e
+                        }
+                        Err(e) => {
+                            tab.column_errors.insert(dir.clone(), e.to_string());
+                            Vec::new()
+                        }
+                    };
                     tab.column_cache.insert(dir, Arc::new(entries));
                     cx.notify();
                 });
@@ -886,13 +968,14 @@ impl Tab {
         };
         if entry.is_navigable() {
             self.navigate(Location::Dir(entry.path.clone()), true, cx);
-            if let Some(first) = self
-                .column_cache
-                .get(&entry.path)
-                .and_then(|v| v.first())
-                .map(|e| e.path.clone())
-            {
-                self.pending_select = vec![first];
+            // The peek listing was sorted with the parent's sort; the folder
+            // now uses its own, so pick its first item under that order.
+            if let Some(cached) = self.column_cache.get(&entry.path) {
+                let mut entries = cached.as_ref().clone();
+                sort::sort_entries(&mut entries, &self.sort);
+                if let Some(first) = entries.first() {
+                    self.pending_select = vec![first.path.clone()];
+                }
             }
         }
     }
@@ -926,13 +1009,15 @@ impl Tab {
         };
         if let Preview::Text(t) = &self.preview
             && t.path == entry.path
+            && t.file_size == entry.size
+            && t.file_modified == entry.modified
         {
             return;
         }
         if entry.is_dir {
             let path = entry.path.clone();
             self.preview = Preview::Folder { entry, count: None };
-            self.preview_task = Some(cx.spawn(async move |this, cx| {
+            self.preview_task = Some(PreviewJob::new(cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(40))
                     .await;
@@ -946,76 +1031,138 @@ impl Tab {
                         cx.notify();
                     }
                 });
-            }));
+            })));
             return;
         }
-        if is_image_ext(&entry.ext) {
+        if is_image_ext(&entry.ext) || is_native_image_ext(&entry.ext) {
             self.preview = Preview::Image(entry);
             self.preview_task = None;
             return;
         }
         let path = entry.path.clone();
+        let (file_size, file_modified) = (entry.size, entry.modified);
         self.preview = Preview::Loading;
         let mono = font(MONO_FONT);
-        self.preview_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(35))
-                .await;
-            let loaded = cx
-                .background_executor()
-                .spawn(load_text(path.clone()))
-                .await;
-            let Some((text, truncated, bytes)) = loaded else {
-                let _ = this.update(cx, |tab, cx| {
-                    tab.preview = Preview::Info(entry);
-                    cx.notify();
-                });
-                return;
-            };
-            let first_line = text.lines().next().map(str::to_string);
-            let lang = haven_highlight::detect(&path, first_line.as_deref());
-            let text = Arc::new(text);
-            let lines: Arc<Vec<SharedString>> = Arc::new(
-                text.split('\n')
-                    .take(50_000)
-                    .map(|l| SharedString::from(l.to_string()))
-                    .collect(),
-            );
-            let _ = this.update(cx, |tab, cx| {
-                tab.preview_scroll = UniformListScrollHandle::new();
-                tab.preview = Preview::Text(TextPreview {
-                    path: path.clone(),
-                    lines: lines.clone(),
-                    runs: None,
-                    lang: lang.map(|l| l.name()),
-                    truncated,
-                    bytes,
-                });
-                cx.notify();
-            });
-            let Some(lang) = lang else { return };
-            if text.len() > 1_500_000 {
-                return;
-            }
-            let spans = cx
-                .background_executor()
-                .spawn({
-                    let text = text.clone();
-                    async move { haven_highlight::highlight(lang, &text, None) }
-                })
-                .await;
-            let Some(spans) = spans else { return };
-            let _ = this.update(cx, |tab, cx| {
-                let t = theme(cx).clone();
-                let runs = build_runs(&lines, &spans, &mono, t.text, |s| t.syntax(s));
-                if let Preview::Text(tp) = &mut tab.preview
-                    && tp.path == path
-                {
-                    tp.runs = Some(Arc::new(runs));
-                    cx.notify();
+        let cancel = Arc::new(AtomicUsize::new(0));
+        let highlight_cancel = cancel.clone();
+        self.preview_task = Some(PreviewJob {
+            cancel,
+            _task: cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(35))
+                    .await;
+                let loaded = cx
+                    .background_executor()
+                    .spawn(load_text(path.clone()))
+                    .await;
+                let Some((text, truncated, bytes)) = loaded else {
+                    let _ = this.update(cx, |tab, cx| {
+                        tab.preview = Preview::Info(entry);
+                        cx.notify();
+                    });
+                    return;
+                };
+                let first_line = text.lines().next().map(str::to_string);
+                let lang = haven_highlight::detect(&path, first_line.as_deref());
+                let text = Arc::new(text);
+                // Cap what gets shaped: at most MAX_PREVIEW_LINES lines, each cut
+                // to MAX_LINE_BYTES (a minified 1 MB line would be shaped every
+                // frame, and the pane doesn't scroll horizontally anyway).
+                let mut lines_vec = Vec::new();
+                for line in text.split('\n').take(MAX_PREVIEW_LINES) {
+                    lines_vec.push(cap_line(line));
                 }
-            });
-        }));
+                // (A trailing newline after exactly MAX lines is not "more".)
+                let truncated = truncated
+                    || text
+                        .split('\n')
+                        .skip(MAX_PREVIEW_LINES)
+                        .any(|l| !l.is_empty());
+                let lines: Arc<Vec<SharedString>> = Arc::new(lines_vec);
+                let _ = this.update(cx, |tab, cx| {
+                    tab.preview_scroll = UniformListScrollHandle::new();
+                    tab.preview = Preview::Text(TextPreview {
+                        path: path.clone(),
+                        lines: lines.clone(),
+                        runs: None,
+                        lang: lang.map(|l| l.name()),
+                        truncated,
+                        bytes,
+                        file_size,
+                        file_modified,
+                    });
+                    cx.notify();
+                });
+                let Some(lang) = lang else { return };
+                if text.len() > 1_500_000 {
+                    return;
+                }
+                let spans = cx
+                    .background_executor()
+                    .spawn({
+                        let text = text.clone();
+                        // Cancelled when the user moves on (the job is dropped).
+                        let cancel = highlight_cancel.clone();
+                        async move { haven_highlight::highlight(lang, &text, Some(&cancel)) }
+                    })
+                    .await;
+                let Some(spans) = spans else { return };
+                let _ = this.update(cx, |tab, cx| {
+                    let t = theme(cx).clone();
+                    let runs = build_runs(&lines, &spans, &mono, t.text, |s| t.syntax(s));
+                    if let Preview::Text(tp) = &mut tab.preview
+                        && tp.path == path
+                    {
+                        tp.runs = Some(Arc::new(runs));
+                        cx.notify();
+                    }
+                });
+            }),
+        });
+    }
+}
+
+/// A preview line, cut at MAX_LINE_BYTES (on a char boundary) with `…`.
+fn cap_line(line: &str) -> SharedString {
+    if line.len() > MAX_LINE_BYTES {
+        let end = floor_char_boundary(line, MAX_LINE_BYTES);
+        SharedString::from(format!("{}…", &line[..end]))
+    } else {
+        SharedString::from(line.to_string())
+    }
+}
+
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+const MAX_PREVIEW_LINES: usize = 50_000;
+const MAX_LINE_BYTES: usize = 4096;
+
+/// The running preview load. Dropping it (new selection, navigation) cancels
+/// the task and any syntax highlighting in flight, which otherwise keeps
+/// running on a background thread.
+struct PreviewJob {
+    _task: Task<()>,
+    cancel: Arc<AtomicUsize>,
+}
+
+impl PreviewJob {
+    fn new(task: Task<()>) -> Self {
+        PreviewJob {
+            _task: task,
+            cancel: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl Drop for PreviewJob {
+    fn drop(&mut self) {
+        self.cancel.store(1, Ordering::Relaxed);
     }
 }
 
@@ -1071,8 +1218,11 @@ fn build_runs(
             let mut pos = 0;
             if let Some(line_spans) = spans.get(i) {
                 for (range, style) in line_spans {
-                    let start = range.start.min(line.len());
-                    let end = range.end.min(line.len());
+                    // Spans come from the full text; a long line was cut and
+                    // got a `…`, so snap to char boundaries of what's shown
+                    // (gpui panics on a run that splits a character).
+                    let start = floor_char_boundary(line, range.start);
+                    let end = floor_char_boundary(line, range.end);
                     if start < pos || end <= start {
                         continue;
                     }
@@ -1094,13 +1244,15 @@ fn build_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Entity, TestAppContext};
 
     fn init(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::store::init_test_env();
             crate::store::Store::init(cx);
             cx.set_global(crate::theme::Theme::dark());
+            crate::icons::IconCache::init(cx);
+            cx.set_global(crate::views::start::StartData::default());
         });
     }
 
@@ -1202,6 +1354,218 @@ mod tests {
                 }
                 _ => panic!("expected text preview"),
             }
+        });
+    }
+
+    fn click(tab: &Entity<Tab>, ix: usize, count: usize, cx: &mut gpui::VisualTestContext) {
+        tab.update_in(cx, |t, window, cx| {
+            t.mouse_down_item(ix, gpui::Modifiers::default(), count, window, cx)
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn double_click_on_folder_never_opens_what_lands_under_the_pointer(
+        cx: &mut TestAppContext,
+    ) {
+        init(cx);
+        let root = fixture();
+        let (tab, cx) = cx.add_window_view(|_, cx| Tab::new(Location::Dir(root.clone()), cx));
+        cx.run_until_parked();
+        // Double-click `alpha` (row 0): opens the folder.
+        click(&tab, 0, 1, cx);
+        click(&tab, 0, 2, cx);
+        tab.read_with(cx, |t, _| {
+            assert_eq!(t.dir(), Some(root.join("alpha").as_path()));
+            assert_eq!(t.entries[0].name, "inner.txt");
+        });
+        // A late click of the same gesture lands on `inner.txt`, now in row 0.
+        // It must not open the file (the test platform panics on any open).
+        click(&tab, 0, 2, cx);
+        click(&tab, 0, 3, cx);
+        tab.read_with(cx, |t, _| {
+            assert_eq!(t.dir(), Some(root.join("alpha").as_path()))
+        });
+    }
+
+    #[gpui::test]
+    async fn double_click_must_hit_the_item_the_first_click_selected(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (tab, cx) = cx.add_window_view(|_, cx| Tab::new(Location::Dir(root.clone()), cx));
+        cx.run_until_parked();
+        // First click on `alpha`, second (count 2) on `beta`: no open.
+        click(&tab, 0, 1, cx);
+        click(&tab, 1, 2, cx);
+        tab.read_with(cx, |t, _| assert_eq!(t.dir(), Some(root.as_path())));
+        // A proper double-click on `beta` still opens it.
+        click(&tab, 1, 1, cx);
+        click(&tab, 1, 2, cx);
+        tab.read_with(cx, |t, _| {
+            assert_eq!(t.dir(), Some(root.join("beta").as_path()))
+        });
+    }
+
+    #[gpui::test]
+    async fn preview_refreshes_when_the_file_changes_in_place(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let tab = cx.new(|cx| Tab::new(Location::Dir(root.clone()), cx));
+        cx.run_until_parked();
+        let preview_first_line = |tab: &Entity<Tab>, cx: &mut TestAppContext| {
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            tab.read_with(cx, |t, _| match &t.preview {
+                Preview::Text(tp) => tp.lines[0].to_string(),
+                _ => panic!("expected text preview"),
+            })
+        };
+        tab.update(cx, |t, cx| {
+            let ix = t.entries.iter().position(|e| e.name == "notes.md").unwrap();
+            t.select_only(ix, cx);
+        });
+        assert_eq!(preview_first_line(&tab, cx), "# hi");
+        // Same path, new content (e.g. an undo restored an older version).
+        std::fs::write(root.join("notes.md"), b"# changed on disk").unwrap();
+        tab.update(cx, |t, cx| t.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(preview_first_line(&tab, cx), "# changed on disk");
+    }
+
+    #[gpui::test]
+    async fn quick_shift_click_on_another_row_still_extends(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (tab, cx) = cx.add_window_view(|_, cx| Tab::new(Location::Dir(root.clone()), cx));
+        cx.run_until_parked();
+        click(&tab, 0, 1, cx);
+        // macOS can report count 2 for a fast second click elsewhere.
+        tab.update_in(cx, |t, window, cx| {
+            let shift = gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            };
+            t.mouse_down_item(2, shift, 2, window, cx)
+        });
+        tab.read_with(cx, |t, _| {
+            assert_eq!(t.dir(), Some(root.as_path()));
+            assert_eq!(t.selection.len(), 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn grid_arrow_keys_move_by_rows(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        for i in 0..7 {
+            std::fs::write(dir.join(format!("f{i}")), b"").unwrap();
+        }
+        let tab = cx.new(|cx| Tab::new(Location::Dir(dir.clone()), cx));
+        cx.run_until_parked();
+        tab.update(cx, |t, cx| {
+            t.view = ViewMode::Grid;
+            t.grid_cols = 3;
+            t.select_only(1, cx);
+            t.move_rows(-1, false, cx); // first row: stays
+            assert_eq!(t.cursor, Some(1));
+            t.move_rows(1, false, cx);
+            assert_eq!(t.cursor, Some(4));
+            t.move_rows(1, false, cx); // short last row: its last item
+            assert_eq!(t.cursor, Some(6));
+            t.move_rows(1, false, cx); // already on the last row
+            assert_eq!(t.cursor, Some(6));
+            t.select_only(1, cx);
+            t.move_rows(1, true, cx); // shift+down extends by a row
+            assert_eq!(t.selection.len(), 4);
+        });
+    }
+
+    #[gpui::test]
+    async fn preview_caps_lines_and_says_so(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let mut text = "x".repeat(10_000);
+        text.push('\n');
+        text.push_str(&"line\n".repeat(MAX_PREVIEW_LINES + 10));
+        std::fs::write(dir.join("big.txt"), text).unwrap();
+        let tab = cx.new(|cx| Tab::new(Location::Dir(dir.clone()), cx));
+        cx.run_until_parked();
+        tab.update(cx, |t, cx| t.select_only(0, cx));
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        tab.read_with(cx, |t, _| match &t.preview {
+            Preview::Text(tp) => {
+                assert!(tp.truncated, "more lines than shown");
+                assert_eq!(tp.lines.len(), MAX_PREVIEW_LINES);
+                assert!(tp.lines[0].len() <= MAX_LINE_BYTES + '…'.len_utf8());
+                assert!(tp.lines[0].ends_with('…'));
+            }
+            _ => panic!("expected text preview"),
+        });
+    }
+
+    #[gpui::test]
+    async fn unreadable_column_reports_an_error(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        init(cx);
+        let root = fixture();
+        let locked = root.join("beta");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let tab = cx.new(|cx| Tab::new(Location::Dir(root.clone()), cx));
+        cx.run_until_parked();
+        tab.update(cx, |t, cx| {
+            let _ = t.column_listing(&locked, cx);
+        });
+        cx.run_until_parked();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tab.read_with(cx, |t, _| assert!(t.column_errors.contains_key(&locked)));
+    }
+
+    #[test]
+    fn runs_on_cut_minified_lines_stay_on_char_boundaries() {
+        // One long JSON line, shifted so tokens straddle the cut and the `…`.
+        for shift in 0..12 {
+            let mut src = String::from("[");
+            src.push_str(&"x".repeat(shift));
+            src.push_str("1,");
+            while src.len() < MAX_LINE_BYTES + 200 {
+                src.push_str(r#"{"key":"valué","n":12345,"t":true},"#);
+            }
+            src.push_str("null]");
+            let text = haven_highlight::normalize(&src);
+            let spans = haven_highlight::highlight(haven_highlight::Lang::Json, &text, None)
+                .expect("json highlights");
+            let lines: Vec<SharedString> = text.split('\n').map(cap_line).collect();
+            let runs = build_runs(&lines, &spans, &font(MONO_FONT), gpui::black(), |_| {
+                gpui::white()
+            });
+            for (line, line_runs) in lines.iter().zip(&runs) {
+                let mut pos = 0;
+                for r in line_runs {
+                    pos += r.len;
+                    assert!(
+                        line.is_char_boundary(pos),
+                        "run splits a char (shift {shift})"
+                    );
+                }
+                assert_eq!(pos, line.len());
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn exactly_max_lines_with_trailing_newline_is_not_truncated(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        std::fs::write(dir.join("exact.txt"), "l\n".repeat(MAX_PREVIEW_LINES)).unwrap();
+        let tab = cx.new(|cx| Tab::new(Location::Dir(dir.clone()), cx));
+        cx.run_until_parked();
+        tab.update(cx, |t, cx| t.select_only(0, cx));
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        tab.read_with(cx, |t, _| match &t.preview {
+            Preview::Text(tp) => assert!(!tp.truncated),
+            _ => panic!("expected text preview"),
         });
     }
 }
