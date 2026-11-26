@@ -74,6 +74,9 @@ pub struct ContextMenu {
     pub items: Vec<MenuEntry>,
 }
 
+/// Palette rows rendered (and reachable with ↓).
+const PALETTE_ROWS: usize = 60;
+
 pub fn build_context_menu(
     selected: &[Entry],
     on_item: bool,
@@ -785,7 +788,9 @@ pub fn handle_overlay_event(
         Overlay::Palette(p) => match ev {
             TextFieldEvent::Changed => refilter_palette(p, cx),
             TextFieldEvent::Down => {
-                p.selected = (p.selected + 1).min(p.matches.len().saturating_sub(1))
+                // Only the first PALETTE_ROWS matches are rendered.
+                let shown = p.matches.len().min(PALETTE_ROWS);
+                p.selected = (p.selected + 1).min(shown.saturating_sub(1))
             }
             TextFieldEvent::Up => p.selected = p.selected.saturating_sub(1),
             TextFieldEvent::Submit => {
@@ -971,7 +976,7 @@ pub fn render_overlay(
             let rows: Vec<AnyElement> = p
                 .matches
                 .iter()
-                .take(60)
+                .take(PALETTE_ROWS)
                 .enumerate()
                 .map(|(row, &ix)| {
                     let item = &p.items[ix];

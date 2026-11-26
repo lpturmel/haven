@@ -130,8 +130,9 @@ impl Workspace {
         } else {
             initial
         };
-        for loc in initial {
-            ws.add_tab(loc, false, window, cx);
+        // Insert in saved order (add_tab would insert each after the active one).
+        for (i, loc) in initial.into_iter().enumerate() {
+            ws.add_tab_at(loc, i, false, window, cx);
         }
         // Focus the restored active tab (not just the first one) so key
         // bindings reach the visible view.
@@ -198,6 +199,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let at = if self.tabs.is_empty() {
+            0
+        } else {
+            self.active + 1
+        };
+        self.add_tab_at(location, at, activate, window, cx);
+    }
+
+    /// Inserts a tab at `at` (clamped). Keeps the active tab active unless
+    /// `activate` (or it is the first tab).
+    pub fn add_tab_at(
+        &mut self,
+        location: Location,
+        at: usize,
+        activate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let tab = cx.new(|cx| Tab::new(location, cx));
         let sub = cx.subscribe_in(&tab, window, Self::on_tab_event);
         self._subs.push(sub);
@@ -206,14 +225,13 @@ impl Workspace {
         {
             w.watch(&dir);
         }
-        let insert_at = if self.tabs.is_empty() {
-            0
-        } else {
-            self.active + 1
-        };
-        self.tabs.insert(insert_at.min(self.tabs.len()), tab);
+        let insert_at = at.min(self.tabs.len());
+        self.tabs.insert(insert_at, tab);
         if activate || self.tabs.len() == 1 {
-            self.activate(insert_at.min(self.tabs.len() - 1), window, cx);
+            self.activate(insert_at, window, cx);
+        } else if insert_at <= self.active && self.tabs.len() > 1 {
+            // Inserted before the active tab: keep pointing at the same tab.
+            self.active += 1;
         }
         self.save_session(cx);
         cx.notify();
@@ -305,20 +323,17 @@ impl Workspace {
                 cx.notify();
             }
             TabEvent::OpenInTabs(dirs) => {
-                for d in dirs.clone() {
-                    self.add_tab(Location::Dir(d), false, window, cx);
+                // Keep the selection's order: a, b, c open as a, b, c.
+                let first = self.active + 1;
+                for (at, d) in (first..).zip(dirs.iter().cloned()) {
+                    self.add_tab_at(Location::Dir(d), at, false, window, cx);
                 }
             }
             TabEvent::ContextMenu { position, on_item } => {
                 self.open_context_menu(*position, *on_item, window, cx);
             }
             TabEvent::Drop { paths, dest, copy } => {
-                let kind = if *copy || !same_volume(paths, dest) {
-                    OpKind::Copy
-                } else {
-                    OpKind::Move
-                };
-                self.start_transfer(kind, paths.clone(), dest.clone(), window, cx);
+                self.drop_files(paths.clone(), dest.clone(), *copy, window, cx);
             }
         }
     }
@@ -614,6 +629,24 @@ impl Workspace {
         self.active_tab().read(cx).selected_paths()
     }
 
+    /// Finder drop semantics for every drop target (list, sidebar, tab strip,
+    /// path bar): move within a volume, copy across volumes or with ⌥.
+    pub fn drop_files(
+        &mut self,
+        paths: Vec<PathBuf>,
+        dest: PathBuf,
+        copy: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let kind = if copy || !same_volume(&paths, &dest) {
+            OpKind::Copy
+        } else {
+            OpKind::Move
+        };
+        self.start_transfer(kind, paths, dest, window, cx);
+    }
+
     pub fn start_transfer(
         &mut self,
         kind: OpKind,
@@ -651,6 +684,9 @@ impl Workspace {
         policy: Conflict,
         cx: &mut Context<Self>,
     ) {
+        if kind == OpKind::Move && matches!(&self.clipboard, Some((cut, true)) if *cut == sources) {
+            self.clipboard = None;
+        }
         let progress = Progress::new();
         let label = format!(
             "{} {} to “{}”",
@@ -820,13 +856,19 @@ impl Workspace {
             return;
         };
         let label = undo.describe();
+        let record = undo.clone();
         let task = cx.background_executor().spawn(async move { undo.apply() });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |ws, cx| {
                 match result {
                     Ok(_) => ws.show_toast(label, false, cx),
-                    Err(e) => ws.show_toast(format!("Undo failed: {e}"), true, cx),
+                    Err(e) => {
+                        // A failed undo rolls itself back, so keep the record:
+                        // the user can fix the conflict and press ⌘Z again.
+                        ws.undo_stack.push(record);
+                        ws.show_toast(format!("Undo failed: {e}"), true, cx)
+                    }
                 }
                 ws.reload_all(cx);
             });
@@ -841,9 +883,8 @@ impl Workspace {
         let Some(dest) = self.active_tab().read(cx).dir().map(Path::to_path_buf) else {
             return;
         };
-        if cut {
-            self.clipboard = None;
-        }
+        // A cut is consumed when the move actually runs (see run_transfer),
+        // so cancelling the conflict dialog keeps it for another try.
         self.start_transfer(
             if cut { OpKind::Move } else { OpKind::Copy },
             paths,
@@ -1028,10 +1069,20 @@ impl Workspace {
         Store::update(cx, |s| {
             s.learn_tag(&tag);
         });
-        if let Err(e) = haven_core::tags::set_tag(&paths, &tag, on) {
-            self.show_toast(format!("Couldn't tag: {e}"), true, cx);
-        }
-        self.active_tab().clone().update(cx, |t, cx| t.reload(cx));
+        // xattr writes for many files: off the UI thread.
+        let task = cx
+            .background_executor()
+            .spawn(async move { haven_core::tags::set_tag(&paths, &tag, on) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |ws, cx| {
+                if let Err(e) = result {
+                    ws.show_toast(format!("Couldn't tag: {e}"), true, cx);
+                }
+                ws.active_tab().clone().update(cx, |t, cx| t.reload(cx));
+            });
+        })
+        .detach();
     }
 
     pub fn toggle_tag_on_selection(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -1168,7 +1219,12 @@ pub fn refresh_start_data(cx: &mut App) {
         let rec = if fresh {
             None
         } else {
-            Some(recents::merge(history, recents::spotlight_recents(14), 40))
+            let merged = recents::merge(history, recents::spotlight_recents(14), 40);
+            let entries: Vec<Option<Entry>> = merged
+                .iter()
+                .map(|r| Entry::from_path(&r.path).ok())
+                .collect();
+            Some((merged, entries))
         };
         (vols, rec)
     });
@@ -1177,8 +1233,9 @@ pub fn refresh_start_data(cx: &mut App) {
         let _ = cx.update(|cx| {
             let data = cx.global_mut::<StartData>();
             data.volumes = vols;
-            if let Some(r) = rec {
+            if let Some((r, entries)) = rec {
                 data.recents = r;
+                data.recent_entries = entries;
                 data.recents_loaded = Some(Instant::now());
             }
         });
@@ -1542,5 +1599,109 @@ mod tests {
         draw(cx);
         assert!(!ws.read_with(cx, |ws, _| ws.path_editing));
         assert!(active_tab_focused(&ws, cx));
+    }
+
+    fn tab_dirs(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<PathBuf> {
+        ws.read_with(cx, |ws, cx| {
+            ws.tabs
+                .iter()
+                .map(|t| t.read(cx).dir().unwrap().to_path_buf())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    async fn session_tabs_restore_in_order_and_open_in_tabs_keeps_order(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        for d in ["a", "b", "c", "x", "y", "z"] {
+            std::fs::create_dir(root.join(d)).unwrap();
+        }
+        let locs: Vec<Location> = ["a", "b", "c"]
+            .iter()
+            .map(|d| Location::Dir(root.join(d)))
+            .collect();
+        let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(locs, 1, window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            tab_dirs(&ws, cx),
+            vec![root.join("a"), root.join("b"), root.join("c")]
+        );
+        assert_eq!(ws.read_with(cx, |ws, _| ws.active), 1);
+        // "Open in tabs" from tab b: x, y, z land right after it, in order.
+        let tab = ws.read_with(cx, |ws, _| ws.active_tab().clone());
+        tab.update(cx, |_, cx| {
+            cx.emit(TabEvent::OpenInTabs(vec![
+                root.join("x"),
+                root.join("y"),
+                root.join("z"),
+            ]))
+        });
+        cx.run_until_parked();
+        let names: Vec<String> = tab_dirs(&ws, cx)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a", "b", "x", "y", "z", "c"]);
+        assert_eq!(ws.read_with(cx, |ws, _| ws.active), 1);
+    }
+
+    #[gpui::test]
+    async fn cmd_z_in_a_text_field_never_undoes_file_operations(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        std::fs::write(root.join("made.txt"), b"x").unwrap();
+        ws.update(cx, |ws, _| {
+            ws.undo_stack
+                .push(Undo::Created(vec![root.join("made.txt")]))
+        });
+        cx.simulate_keystrokes("cmd-f n cmd-z");
+        cx.run_until_parked();
+        assert!(root.join("made.txt").exists(), "file undo must not run");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.undo_stack.len()), 1);
+        let filter = ws.read_with(cx, |ws, cx| ws.filter_field.read(cx).text().to_string());
+        assert_eq!(filter, "", "⌘Z undid the typing instead");
+    }
+
+    #[gpui::test]
+    async fn cancelled_conflict_keeps_the_cut(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        std::fs::create_dir(root.join("dst")).unwrap();
+        std::fs::write(root.join("dst/readme.md"), b"other").unwrap();
+        let (ws, cx) = open(cx, Location::Dir(root.join("dst")));
+        let cut = vec![root.join("projects/readme.md")];
+        ws.update_in(cx, |ws, window, cx| {
+            ws.clipboard = Some((cut.clone(), true));
+            ws.paste(window, cx);
+            assert!(matches!(ws.overlay, Some(Overlay::Conflict { .. })));
+            ws.close_overlay(window, cx);
+        });
+        assert_eq!(
+            ws.read_with(cx, |ws, _| ws.clipboard.clone()),
+            Some((cut, true))
+        );
+        assert!(root.join("projects/readme.md").exists());
+    }
+
+    #[gpui::test]
+    async fn space_continues_type_to_select(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        std::fs::write(root.join("my file.txt"), b"").unwrap();
+        std::fs::write(root.join("my-notes.txt"), b"").unwrap();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        let before = cx.update(|_, cx| Store::get(cx).preview_visible);
+        cx.simulate_keystrokes("m y space f");
+        cx.run_until_parked();
+        let name = ws.read_with(cx, |ws, cx| {
+            ws.active_tab()
+                .read(cx)
+                .cursor_entry()
+                .map(|e| e.name.clone())
+        });
+        assert_eq!(name.as_deref(), Some("my file.txt"));
+        assert_eq!(cx.update(|_, cx| Store::get(cx).preview_visible), before);
     }
 }

@@ -197,17 +197,19 @@ fn main() {
             cx.quit()
         });
 
-        let window = open_window(cx, args.clone());
+        // The window may be closed while the app keeps running (red button):
+        // reopen events and opened URLs then create a fresh window.
+        let handle = std::rc::Rc::new(std::cell::Cell::new(open_window(cx, args.clone())));
 
         // Folders/files opened via Finder, `open -a Haven`, or NSFileViewer.
-        let handle = window;
+        let urls_handle = handle.clone();
         cx.spawn(async move |cx| {
             while let Ok(urls) = url_rx.recv().await {
                 let paths: Vec<PathBuf> = urls.iter().filter_map(|u| url_to_path(u)).collect();
-                let _ = handle.update(cx, |ws, window, cx| {
-                    for p in paths {
+                let shown = urls_handle.get().update(cx, |ws, window, cx| {
+                    for p in &paths {
                         if p.is_dir() {
-                            ws.add_tab(Location::Dir(p), true, window, cx);
+                            ws.add_tab(Location::Dir(p.clone()), true, window, cx);
                         } else if let Some(parent) = p.parent() {
                             ws.add_tab(Location::Dir(parent.to_path_buf()), true, window, cx);
                             let tab = ws.active_tab().clone();
@@ -218,12 +220,35 @@ fn main() {
                     }
                     window.activate_window();
                 });
+                if shown.is_err() {
+                    let dirs: Vec<PathBuf> = paths
+                        .iter()
+                        .filter_map(|p| {
+                            if p.is_dir() {
+                                Some(p.clone())
+                            } else {
+                                p.parent().map(|d| d.to_path_buf())
+                            }
+                        })
+                        .collect();
+                    if let Ok(w) = cx.update(|cx| open_window(cx, dirs)) {
+                        urls_handle.set(w);
+                    }
+                }
             }
         })
         .detach();
+        let reopen_handle = handle.clone();
         cx.spawn(async move |cx| {
             while reopen_rx.recv().await.is_ok() {
-                let _ = handle.update(cx, |_, window, _| window.activate_window());
+                let shown = reopen_handle
+                    .get()
+                    .update(cx, |_, window, _| window.activate_window());
+                if shown.is_err()
+                    && let Ok(w) = cx.update(|cx| open_window(cx, Vec::new()))
+                {
+                    reopen_handle.set(w);
+                }
             }
         })
         .detach();

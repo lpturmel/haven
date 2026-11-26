@@ -13,6 +13,8 @@ pub enum IconSize {
     Small,
     /// Grid tiles and start page.
     Large,
+    /// The preview pane.
+    Preview,
 }
 
 impl IconSize {
@@ -20,6 +22,7 @@ impl IconSize {
         match self {
             IconSize::Small => 64.0,
             IconSize::Large => 256.0,
+            IconSize::Preview => 1024.0,
         }
     }
 }
@@ -36,10 +39,15 @@ impl Global for IconCache {}
 enum Source {
     Type(String),
     Path(String),
+    /// A real thumbnail of an image GPUI can't decode (HEIC, RAW, ...).
+    Thumb(String),
 }
 
 fn source_for(path: &Path, is_dir: bool, is_package: bool, ext: &str) -> Source {
     let p = path.to_string_lossy();
+    if !is_dir && haven_core::kind::is_native_image_ext(ext) {
+        return Source::Thumb(p.into_owned());
+    }
     if is_package || matches!(ext, "icns" | "app") {
         return Source::Path(p.into_owned());
     }
@@ -93,6 +101,7 @@ pub fn path_icon(
     let key = match &source {
         Source::Type(t) => (format!("t:{t}"), size),
         Source::Path(p) => (format!("p:{p}"), size),
+        Source::Thumb(p) => (format!("i:{p}"), size),
     };
     let cache = cx.global::<IconCache>();
     if let Some(hit) = cache.map.get(&key) {
@@ -107,6 +116,8 @@ pub fn path_icon(
         let png = match source {
             Source::Type(t) => haven_macos::type_icon_png(&t, px),
             Source::Path(p) => haven_macos::file_icon_png(Path::new(&p), px),
+            Source::Thumb(p) => haven_macos::image_thumbnail_png(Path::new(&p), px as u32)
+                .or_else(|| haven_macos::file_icon_png(Path::new(&p), px)),
         };
         png.map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
     });

@@ -79,6 +79,17 @@ const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "svg", "ico",
 ];
 
+/// Images only macOS (ImageIO) can decode: photos and camera RAW. Haven shows
+/// them through native thumbnails.
+const NATIVE_IMAGE_EXTS: &[&str] = &[
+    "heic", "heif", "avif", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "psd", "jp2",
+    "exr", "tga",
+];
+
+pub fn is_native_image_ext(ext: &str) -> bool {
+    NATIVE_IMAGE_EXTS.contains(&ext)
+}
+
 /// Images GPUI can decode directly.
 pub fn is_image_ext(ext: &str) -> bool {
     IMAGE_EXTS.contains(&ext)

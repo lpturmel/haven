@@ -2,19 +2,30 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+/// Canonical directory -> the paths tabs asked to watch for it.
+type Aliases = Arc<Mutex<HashMap<PathBuf, Vec<PathBuf>>>>;
+
 /// Watches a set of directories and reports which one changed.
+///
+/// FSEvents reports canonical paths (`/private/tmp/...` for `/tmp/...`, the
+/// target of a symlinked folder, ...). Directories are watched by their
+/// canonical path and events are translated back to the path each tab uses.
 pub struct DirWatcher {
     watcher: RecommendedWatcher,
     counts: HashMap<PathBuf, usize>,
+    aliases: Aliases,
 }
 
 impl DirWatcher {
     /// `on_change` receives the watched directory whose contents changed. It is
     /// called from a background thread and should be cheap (e.g. send on a channel).
     pub fn new(on_change: impl Fn(PathBuf) + Send + 'static) -> notify::Result<DirWatcher> {
+        let aliases: Aliases = Arc::default();
+        let lookup = aliases.clone();
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
             if matches!(event.kind, EventKind::Access(_)) {
@@ -25,33 +36,72 @@ impl DirWatcher {
                 .iter()
                 .filter_map(|p| p.parent().map(Path::to_path_buf))
                 .collect();
+            dirs.sort();
             dirs.dedup();
+            let map = lookup.lock().map(|m| m.clone()).unwrap_or_default();
             for d in dirs {
-                on_change(d);
+                match map.get(&d) {
+                    Some(requested) => requested.iter().cloned().for_each(&on_change),
+                    None => on_change(d),
+                }
             }
         })?;
         Ok(DirWatcher {
             watcher,
             counts: HashMap::new(),
+            aliases,
         })
+    }
+
+    fn canonical(dir: &Path) -> PathBuf {
+        std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
     }
 
     /// Reference-counted watch so several tabs can share a directory.
     pub fn watch(&mut self, dir: &Path) {
         let count = self.counts.entry(dir.to_path_buf()).or_insert(0);
-        if *count == 0 {
-            let _ = self.watcher.watch(dir, RecursiveMode::NonRecursive);
-        }
         *count += 1;
+        if *count > 1 {
+            return;
+        }
+        let canon = Self::canonical(dir);
+        let first = {
+            let mut map = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+            let list = map.entry(canon.clone()).or_default();
+            list.push(dir.to_path_buf());
+            list.len() == 1
+        };
+        if first {
+            let _ = self.watcher.watch(&canon, RecursiveMode::NonRecursive);
+        }
     }
 
     pub fn unwatch(&mut self, dir: &Path) {
-        if let Some(count) = self.counts.get_mut(dir) {
-            *count -= 1;
-            if *count == 0 {
-                self.counts.remove(dir);
-                let _ = self.watcher.unwatch(dir);
+        let Some(count) = self.counts.get_mut(dir) else {
+            return;
+        };
+        *count -= 1;
+        if *count > 0 {
+            return;
+        }
+        self.counts.remove(dir);
+        let canon = Self::canonical(dir);
+        let last = {
+            let mut map = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+            match map.get_mut(&canon) {
+                Some(list) => {
+                    list.retain(|p| p != dir);
+                    let empty = list.is_empty();
+                    if empty {
+                        map.remove(&canon);
+                    }
+                    empty
+                }
+                None => true,
             }
+        };
+        if last {
+            let _ = self.watcher.unwatch(&canon);
         }
     }
 }
@@ -80,5 +130,29 @@ mod tests {
         assert_eq!(got, root);
         w.unwatch(&root);
         assert!(w.counts.is_empty());
+    }
+
+    #[test]
+    fn reports_changes_under_the_path_the_tab_used() {
+        // Watch through a symlink: events arrive for the canonical path but
+        // must be reported for the requested one.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut w = DirWatcher::new(move |d| {
+            let _ = tx.send(d);
+        })
+        .unwrap();
+        w.watch(&root.join("link"));
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(root.join("real/new.txt"), b"x").unwrap();
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("change event");
+        assert_eq!(got, root.join("link"));
+        w.unwatch(&root.join("link"));
+        assert!(w.aliases.lock().unwrap().is_empty());
     }
 }

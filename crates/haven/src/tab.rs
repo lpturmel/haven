@@ -3,14 +3,14 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
     Context, EventEmitter, FocusHandle, Font, Hsla, Modifiers, Pixels, Point, ScrollStrategy,
     SharedString, Task, TextRun, UniformListScrollHandle, Window, font,
 };
 use haven_core::dirsize::{self, Control};
-use haven_core::kind::is_image_ext;
+use haven_core::kind::{is_image_ext, is_native_image_ext};
 use haven_core::sort::{self, SortKey, SortSpec};
 use haven_core::state::{FolderPrefs, ViewMode};
 use haven_core::{Entry, list_dir, tags};
@@ -80,6 +80,9 @@ pub struct TextPreview {
     pub lang: Option<&'static str>,
     pub truncated: bool,
     pub bytes: u64,
+    /// The file's size and mtime when it was read, to notice in-place edits.
+    pub file_size: u64,
+    pub file_modified: Option<SystemTime>,
 }
 
 pub enum Preview {
@@ -103,6 +106,12 @@ pub struct Tab {
     pub cursor: Option<usize>,
     anchor: Option<usize>,
     pending_collapse: Option<usize>,
+    /// Path under the first click of a potential double-click. A second
+    /// click only opens if the same item is still under it.
+    click_origin: Option<PathBuf>,
+    /// Set once a double-click opened something; the rest of that click
+    /// gesture (count >= 2) is ignored until a fresh single click.
+    click_consumed: bool,
     pub view: ViewMode,
     pub sort: SortSpec,
     pub loading: bool,
@@ -141,6 +150,8 @@ impl Tab {
             cursor: None,
             anchor: None,
             pending_collapse: None,
+            click_origin: None,
+            click_consumed: false,
             view: Store::get(cx).default_view,
             sort: Store::get(cx).default_sort.clone(),
             loading: false,
@@ -232,6 +243,9 @@ impl Tab {
         self.preview = Preview::None;
         self.error = None;
         self.pending_select.clear();
+        self.click_origin = None;
+        // A preview still loading for the old folder must not land here.
+        self.preview_task = None;
         if let Some(dir) = self.dir().map(Path::to_path_buf) {
             let prefs = Store::get(cx).prefs_for(&dir);
             self.view = prefs.view;
@@ -428,6 +442,9 @@ impl Tab {
         let first_wanted = self.pending_select.first().cloned();
         self.pending_select.clear();
         if ixs.is_empty() {
+            // The selected items are gone (deleted or renamed elsewhere):
+            // drop their preview too.
+            self.update_preview(cx);
             return;
         }
         self.selection = ixs.iter().copied().collect();
@@ -458,6 +475,7 @@ impl Tab {
         };
         self.selection.clear();
         self.cursor = None;
+        self.anchor = None;
         self.pending_select = selected;
         if self.pending_select.is_empty() && !self.filter.is_empty() && !self.entries.is_empty() {
             self.select_only(0, cx);
@@ -644,6 +662,7 @@ impl Tab {
         self.cursor = None;
         self.anchor = None;
         self.preview = Preview::None;
+        self.preview_task = None;
         cx.notify();
     }
 
@@ -702,11 +721,28 @@ impl Tab {
             self.context_item(ix, position, window, cx);
             return;
         }
+        let path = self.entries.get(ix).map(|e| e.path.clone());
         if click_count >= 2 {
-            self.select_only(ix, cx);
-            self.open_selected(window, cx);
-            return;
+            // After a double-click opened something (e.g. navigated into a
+            // folder), the gesture's remaining clicks must not act on whatever
+            // now sits under the pointer.
+            if self.click_consumed {
+                return;
+            }
+            // Only open what the first click selected.
+            if path.is_some() && self.click_origin == path {
+                self.click_consumed = true;
+                self.click_origin = None;
+                self.select_only(ix, cx);
+                self.open_selected(window, cx);
+                return;
+            }
+            // A quick click on a different item (e.g. a shift-click right after
+            // a click elsewhere): handle it as a normal click below.
+        } else {
+            self.click_consumed = false;
         }
+        self.click_origin = path;
         if modifiers.platform {
             self.toggle_select(ix, cx);
         } else if modifiers.shift {
@@ -926,6 +962,8 @@ impl Tab {
         };
         if let Preview::Text(t) = &self.preview
             && t.path == entry.path
+            && t.file_size == entry.size
+            && t.file_modified == entry.modified
         {
             return;
         }
@@ -949,12 +987,13 @@ impl Tab {
             }));
             return;
         }
-        if is_image_ext(&entry.ext) {
+        if is_image_ext(&entry.ext) || is_native_image_ext(&entry.ext) {
             self.preview = Preview::Image(entry);
             self.preview_task = None;
             return;
         }
         let path = entry.path.clone();
+        let (file_size, file_modified) = (entry.size, entry.modified);
         self.preview = Preview::Loading;
         let mono = font(MONO_FONT);
         self.preview_task = Some(cx.spawn(async move |this, cx| {
@@ -990,6 +1029,8 @@ impl Tab {
                     lang: lang.map(|l| l.name()),
                     truncated,
                     bytes,
+                    file_size,
+                    file_modified,
                 });
                 cx.notify();
             });
@@ -1094,13 +1135,15 @@ fn build_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Entity, TestAppContext};
 
     fn init(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::store::init_test_env();
             crate::store::Store::init(cx);
             cx.set_global(crate::theme::Theme::dark());
+            crate::icons::IconCache::init(cx);
+            cx.set_global(crate::views::start::StartData::default());
         });
     }
 
@@ -1202,6 +1245,102 @@ mod tests {
                 }
                 _ => panic!("expected text preview"),
             }
+        });
+    }
+
+    fn click(tab: &Entity<Tab>, ix: usize, count: usize, cx: &mut gpui::VisualTestContext) {
+        tab.update_in(cx, |t, window, cx| {
+            t.mouse_down_item(ix, gpui::Modifiers::default(), count, window, cx)
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn double_click_on_folder_never_opens_what_lands_under_the_pointer(
+        cx: &mut TestAppContext,
+    ) {
+        init(cx);
+        let root = fixture();
+        let (tab, cx) = cx.add_window_view(|_, cx| Tab::new(Location::Dir(root.clone()), cx));
+        cx.run_until_parked();
+        // Double-click `alpha` (row 0): opens the folder.
+        click(&tab, 0, 1, cx);
+        click(&tab, 0, 2, cx);
+        tab.read_with(cx, |t, _| {
+            assert_eq!(t.dir(), Some(root.join("alpha").as_path()));
+            assert_eq!(t.entries[0].name, "inner.txt");
+        });
+        // A late click of the same gesture lands on `inner.txt`, now in row 0.
+        // It must not open the file (the test platform panics on any open).
+        click(&tab, 0, 2, cx);
+        click(&tab, 0, 3, cx);
+        tab.read_with(cx, |t, _| {
+            assert_eq!(t.dir(), Some(root.join("alpha").as_path()))
+        });
+    }
+
+    #[gpui::test]
+    async fn double_click_must_hit_the_item_the_first_click_selected(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (tab, cx) = cx.add_window_view(|_, cx| Tab::new(Location::Dir(root.clone()), cx));
+        cx.run_until_parked();
+        // First click on `alpha`, second (count 2) on `beta`: no open.
+        click(&tab, 0, 1, cx);
+        click(&tab, 1, 2, cx);
+        tab.read_with(cx, |t, _| assert_eq!(t.dir(), Some(root.as_path())));
+        // A proper double-click on `beta` still opens it.
+        click(&tab, 1, 1, cx);
+        click(&tab, 1, 2, cx);
+        tab.read_with(cx, |t, _| {
+            assert_eq!(t.dir(), Some(root.join("beta").as_path()))
+        });
+    }
+
+    #[gpui::test]
+    async fn preview_refreshes_when_the_file_changes_in_place(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let tab = cx.new(|cx| Tab::new(Location::Dir(root.clone()), cx));
+        cx.run_until_parked();
+        let preview_first_line = |tab: &Entity<Tab>, cx: &mut TestAppContext| {
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            tab.read_with(cx, |t, _| match &t.preview {
+                Preview::Text(tp) => tp.lines[0].to_string(),
+                _ => panic!("expected text preview"),
+            })
+        };
+        tab.update(cx, |t, cx| {
+            let ix = t.entries.iter().position(|e| e.name == "notes.md").unwrap();
+            t.select_only(ix, cx);
+        });
+        assert_eq!(preview_first_line(&tab, cx), "# hi");
+        // Same path, new content (e.g. an undo restored an older version).
+        std::fs::write(root.join("notes.md"), b"# changed on disk").unwrap();
+        tab.update(cx, |t, cx| t.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(preview_first_line(&tab, cx), "# changed on disk");
+    }
+
+    #[gpui::test]
+    async fn quick_shift_click_on_another_row_still_extends(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (tab, cx) = cx.add_window_view(|_, cx| Tab::new(Location::Dir(root.clone()), cx));
+        cx.run_until_parked();
+        click(&tab, 0, 1, cx);
+        // macOS can report count 2 for a fast second click elsewhere.
+        tab.update_in(cx, |t, window, cx| {
+            let shift = gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            };
+            t.mouse_down_item(2, shift, 2, window, cx)
+        });
+        tab.read_with(cx, |t, _| {
+            assert_eq!(t.dir(), Some(root.as_path()));
+            assert_eq!(t.selection.len(), 3);
         });
     }
 }

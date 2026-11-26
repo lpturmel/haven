@@ -109,12 +109,27 @@ pub fn render(tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> Any
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(
+                        .child(if haven_core::kind::is_image_ext(&entry.ext) {
                             img(entry.path.clone())
                                 .size_full()
                                 .object_fit(ObjectFit::Contain)
-                                .rounded(px(6.)),
-                        ),
+                                .rounded(px(6.))
+                                .into_any_element()
+                        } else {
+                            // HEIC / RAW / PSD: a native ImageIO thumbnail.
+                            match crate::icons::entry_icon(
+                                &entry,
+                                crate::icons::IconSize::Preview,
+                                cx,
+                            ) {
+                                Some(image) => img(image)
+                                    .size_full()
+                                    .object_fit(ObjectFit::Contain)
+                                    .rounded(px(6.))
+                                    .into_any_element(),
+                                None => entry_icon_el(&entry, 96., cx),
+                            }
+                        }),
                 )
                 .child(info_table(&entry, cx))
                 .into_any_element()

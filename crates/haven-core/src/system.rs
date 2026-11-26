@@ -48,7 +48,14 @@ pub fn set_default_viewer(enable: bool) -> Result<(), String> {
 
 fn set_folder_handler(enable: bool) -> Result<(), String> {
     let path = ls_plist();
-    let mut root: plist::Dictionary = plist::from_file(&path).unwrap_or_default();
+    // Start empty only if the file doesn't exist yet. Any other read or parse
+    // error must abort: rewriting from an empty dict would wipe every other
+    // file-type association the user has.
+    let mut root: plist::Dictionary = if path.exists() {
+        plist::from_file(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?
+    } else {
+        plist::Dictionary::new()
+    };
     let mut handlers: Vec<plist::Value> = root
         .get("LSHandlers")
         .and_then(|v| v.as_array())
@@ -70,7 +77,9 @@ fn set_folder_handler(enable: bool) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    plist::to_file_binary(&path, &root).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("plist.haven-{}", std::process::id()));
+    plist::to_file_binary(&tmp, &root).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     // LaunchServices picks up handler changes on its next refresh (or at login).
     Ok(())
 }

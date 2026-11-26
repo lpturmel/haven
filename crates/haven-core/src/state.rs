@@ -107,7 +107,29 @@ impl AppState {
     }
 
     pub fn load() -> AppState {
-        Self::load_from(&Self::default_path()).unwrap_or_default()
+        Self::load_or_recover(&Self::default_path())
+    }
+
+    /// Loads `path`; a missing file gives defaults, and an unreadable one is
+    /// moved aside (`state.json.corrupt-<secs>`) before falling back to them.
+    pub fn load_or_recover(path: &Path) -> AppState {
+        match Self::load_from(path) {
+            Ok(state) => state,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => AppState::default(),
+            Err(e) => {
+                // Keep the unreadable file rather than overwriting the user's
+                // pins, tags and prefs on the next save.
+                let backup =
+                    path.with_extension(format!("json.corrupt-{}", crate::recents::now_secs()));
+                eprintln!(
+                    "haven: {}: {e}; moved to {}",
+                    path.display(),
+                    backup.display()
+                );
+                let _ = std::fs::rename(path, &backup);
+                AppState::default()
+            }
+        }
     }
 
     pub fn load_from(path: &Path) -> io::Result<AppState> {
@@ -124,7 +146,11 @@ impl AppState {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("json.tmp");
+        // Unique temp name: the background saver and the quit-time flush may
+        // write concurrently; a shared temp file could be renamed torn.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.tmp-{}-{seq}", std::process::id()));
         let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         std::fs::write(&tmp, json)?;
         std::fs::rename(tmp, path)
@@ -280,5 +306,43 @@ mod tests {
         assert!(s.learn_tag(&Tag::new("Design", TagColor::Red)));
         assert!(!s.learn_tag(&Tag::new("design", TagColor::Blue)));
         assert_eq!(s.tag_color("DESIGN"), Some(TagColor::Red));
+    }
+
+    #[test]
+    fn corrupt_state_is_kept_aside_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        let state = AppState::load_or_recover(&path);
+        assert_eq!(state.tags.len(), 7);
+        assert!(!path.exists());
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].starts_with("state.json.corrupt-"));
+        // Missing file: just defaults, nothing created.
+        let fresh = AppState::load_or_recover(&dir.path().join("none.json"));
+        assert!(fresh.sidebar_pins.is_empty());
+    }
+
+    #[test]
+    fn concurrent_saves_never_leave_a_torn_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let a = AppState {
+            sidebar_pins: (0..200).map(|i| PathBuf::from(format!("/p/{i}"))).collect(),
+            ..Default::default()
+        };
+        let b = AppState::default();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| a.save_to(&path).unwrap());
+                s.spawn(|| b.save_to(&path).unwrap());
+            }
+        });
+        let loaded = AppState::load_from(&path).expect("valid JSON");
+        assert!(loaded.sidebar_pins.is_empty() || loaded.sidebar_pins.len() == 200);
     }
 }

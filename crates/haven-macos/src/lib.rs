@@ -16,6 +16,21 @@ pub fn file_icon_png(path: &Path, px: f64) -> Option<Vec<u8>> {
     }
 }
 
+/// Decodes an image with ImageIO (HEIC, AVIF, RAW, PSD, ... anything macOS
+/// can read) into a PNG thumbnail whose longer side is at most `max_px`,
+/// honouring EXIF orientation. Returns `None` if the file isn't an image.
+pub fn image_thumbnail_png(path: &Path, max_px: u32) -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::image_thumbnail_png(path, max_px)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, max_px);
+        None
+    }
+}
+
 /// Renders the generic icon for a file type (UTI such as `public.folder`, or
 /// a bare extension such as `rs`) as PNG bytes at `px` pixels.
 pub fn type_icon_png(file_type: &str, px: f64) -> Option<Vec<u8>> {
@@ -103,6 +118,42 @@ mod imp {
             rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
         }?;
         Some(data.to_vec())
+    }
+
+    pub fn image_thumbnail_png(path: &Path, max_px: u32) -> Option<Vec<u8>> {
+        use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString, CFType, CFURL};
+        use objc2_image_io::{
+            CGImageSource, kCGImageSourceCreateThumbnailFromImageAlways,
+            kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceThumbnailMaxPixelSize,
+        };
+        autoreleasepool(|_| {
+            let url = CFURL::from_file_path(path)?;
+            // SAFETY: a valid file URL and no options.
+            let source = unsafe { CGImageSource::with_url(&url, None) }?;
+            let yes: &CFType = CFBoolean::new(true);
+            let size = CFNumber::new_i64(i64::from(max_px));
+            // SAFETY: reading ImageIO's constant option keys.
+            let keys: [&CFString; 3] = unsafe {
+                [
+                    kCGImageSourceCreateThumbnailFromImageAlways,
+                    kCGImageSourceCreateThumbnailWithTransform,
+                    kCGImageSourceThumbnailMaxPixelSize,
+                ]
+            };
+            let values: [&CFType; 3] = [yes, yes, &size];
+            let options = CFDictionary::<CFString, CFType>::from_slices(&keys, &values);
+            // SAFETY: the options dictionary holds the documented key/value types.
+            let cg = unsafe { source.thumbnail_at_index(0, Some(options.as_opaque())) }?;
+            let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg);
+            // SAFETY: an empty, correctly typed property dictionary.
+            let data = unsafe {
+                rep.representationUsingType_properties(
+                    NSBitmapImageFileType::PNG,
+                    &NSDictionary::new(),
+                )
+            }?;
+            Some(data.to_vec())
+        })
     }
 
     pub fn file_icon_png(path: &Path, px: f64) -> Option<Vec<u8>> {
@@ -217,6 +268,25 @@ mod imp {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumbnails_heic_and_rejects_non_images() {
+        // macOS ships HEIC wallpapers; use one if present.
+        let dir = std::path::Path::new("/System/Library/Desktop Pictures");
+        let heic = std::fs::read_dir(dir).ok().and_then(|r| {
+            r.flatten()
+                .map(|e| e.path())
+                .find(|p| p.extension().is_some_and(|e| e == "heic"))
+        });
+        if let Some(heic) = heic {
+            let png = image_thumbnail_png(&heic, 256).expect("HEIC decodes");
+            assert_eq!(&png[1..4], b"PNG");
+        }
+        let txt = std::env::temp_dir().join(format!("haven-not-image-{}.txt", std::process::id()));
+        std::fs::write(&txt, b"hello").unwrap();
+        assert!(image_thumbnail_png(&txt, 256).is_none());
+        let _ = std::fs::remove_file(&txt);
+    }
 
     #[test]
     fn renders_folder_type_icon() {

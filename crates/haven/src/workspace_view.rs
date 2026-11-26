@@ -120,12 +120,7 @@ impl Workspace {
                 .drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(t.selection))
                 .on_drop(cx.listener(move |ws, files: &DraggedFiles, window, cx| {
                     let copy = window.modifiers().alt;
-                    let kind = if copy {
-                        haven_core::ops::OpKind::Copy
-                    } else {
-                        haven_core::ops::OpKind::Move
-                    };
-                    ws.start_transfer(kind, files.paths.clone(), p2.clone(), window, cx);
+                    ws.drop_files(files.paths.clone(), p2.clone(), copy, window, cx);
                 }))
                 .on_drop(cx.listener(
                     move |ws, ext: &ExternalPaths, window, cx| {
@@ -508,18 +503,8 @@ impl Workspace {
                     .when_some(dest, |d, dest| {
                         d.drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(t.selection))
                             .on_drop(cx.listener(move |ws, files: &DraggedFiles, window, cx| {
-                                let kind = if window.modifiers().alt {
-                                    haven_core::ops::OpKind::Copy
-                                } else {
-                                    haven_core::ops::OpKind::Move
-                                };
-                                ws.start_transfer(
-                                    kind,
-                                    files.paths.clone(),
-                                    dest.clone(),
-                                    window,
-                                    cx,
-                                );
+                                let copy = window.modifiers().alt;
+                                ws.drop_files(files.paths.clone(), dest.clone(), copy, window, cx);
                             }))
                     })
                     .child(icon(ic).size(px(13.)).text_color(if active {
@@ -669,10 +654,11 @@ impl Workspace {
                                 .on_drop(cx.listener({
                                     let a = a.clone();
                                     move |ws, files: &DraggedFiles, window, cx| {
-                                        ws.start_transfer(
-                                            haven_core::ops::OpKind::Move,
+                                        let copy = window.modifiers().alt;
+                                        ws.drop_files(
                                             files.paths.clone(),
                                             a.clone(),
+                                            copy,
                                             window,
                                             cx,
                                         )
