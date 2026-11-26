@@ -2505,6 +2505,7 @@ dependencies = [
  "haven-highlight",
  "haven-macos",
  "nucleo",
+ "raw-window-handle",
  "smol",
  "tempfile",
  "unicode-segmentation",

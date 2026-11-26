@@ -15,6 +15,7 @@ haven-core.workspace = true
 haven-highlight.workspace = true
 haven-macos.workspace = true
 nucleo.workspace = true
+raw-window-handle = "0.6"
 smol.workspace = true
 unicode-segmentation = "1"
 

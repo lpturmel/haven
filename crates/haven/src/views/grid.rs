@@ -194,13 +194,19 @@ fn tile(
                     tag_dot(t.tag(color), px(7.))
                 }))
                 .child(
+                    // flex_1 gives the label a definite width so long names
+                    // wrap inside the cell (and ellipsize on line 2) instead
+                    // of overflowing it on both sides.
                     div()
+                        .flex_1()
                         .min_w_0()
+                        .overflow_hidden()
                         .text_size(px(12.))
                         .text_color(t.text)
                         .line_height(px(15.))
                         .text_center()
                         .line_clamp(2)
+                        .text_ellipsis()
                         .child(entry.name.clone()),
                 ),
         )

@@ -146,7 +146,13 @@ impl Undo {
             Undo::Moved(pairs) => {
                 let mut back = Vec::new();
                 for (from, to) in pairs.iter().rev() {
-                    if from.exists() {
+                    // After a case-only rename on a case-insensitive volume,
+                    // `from` "exists" because it is the same file as `to`.
+                    let same = match (fs::symlink_metadata(from), fs::symlink_metadata(to)) {
+                        (Ok(a), Ok(b)) => same_file(&a, &b),
+                        _ => false,
+                    };
+                    if from.exists() && !same {
                         return Err(io::Error::new(
                             io::ErrorKind::AlreadyExists,
                             format!("{} already exists", from.display()),
@@ -886,5 +892,23 @@ mod tests {
         let (_d, root) = setup();
         assert_eq!(new_folder(&root).unwrap(), root.join("untitled folder"));
         assert_eq!(new_folder(&root).unwrap(), root.join("untitled folder 2"));
+    }
+
+    #[test]
+    fn case_only_rename_and_its_undo() {
+        let (_d, root) = setup();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        let undo = rename(&root.join("a.txt"), "A.txt").unwrap();
+        let names: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["A.txt"]);
+        undo.apply().unwrap();
+        let names: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.txt"]);
     }
 }

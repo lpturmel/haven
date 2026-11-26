@@ -30,6 +30,27 @@ pub fn type_icon_png(file_type: &str, px: f64) -> Option<Vec<u8>> {
     }
 }
 
+/// Installs a native behind-window blur (the Finder sidebar material) under the
+/// app's content. `ns_view` is the window's content `NSView` (from the window's
+/// AppKit raw handle). Content drawn with transparency, such as the sidebar,
+/// then shows a real frosted backdrop; opaque content hides it. Returns false
+/// when it could not be installed (not on the main thread, or not macOS).
+///
+/// # Safety
+/// `ns_view` must be a valid `NSView` pointer that outlives this call.
+pub unsafe fn install_sidebar_material(ns_view: *mut std::ffi::c_void) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: forwarded caller contract.
+        unsafe { imp::install_sidebar_material(ns_view) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ns_view;
+        false
+    }
+}
+
 /// Moves `path` to the Trash and returns where it ended up (so it can be undone).
 pub fn trash(path: &Path) -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
@@ -111,6 +132,44 @@ mod imp {
         let name = unsafe { NSAppearanceNameDarkAqua };
         let appearance = NSAppearance::appearanceNamed(name);
         NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
+    }
+
+    pub unsafe fn install_sidebar_material(ns_view: *mut std::ffi::c_void) -> bool {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{
+            NSAutoresizingMaskOptions, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+            NSVisualEffectState, NSVisualEffectView, NSWindowOrderingMode,
+        };
+        let Some(mtm) = MainThreadMarker::new() else {
+            return false;
+        };
+        if ns_view.is_null() {
+            return false;
+        }
+        // SAFETY: the caller guarantees a live NSView.
+        let content: &NSView = unsafe { &*(ns_view as *const NSView) };
+        // The content view renders through its own (Metal) layer, which subviews
+        // would cover. Put the material behind it, as a sibling in the window's
+        // frame view, so it only shows where the content is transparent.
+        // SAFETY: reading the superview of a live view on the main thread.
+        let Some(frame_view) = (unsafe { content.superview() }) else {
+            return false;
+        };
+        let effect = NSVisualEffectView::initWithFrame(mtm.alloc(), frame_view.bounds());
+        effect.setMaterial(NSVisualEffectMaterial::Sidebar);
+        effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        // Like Finder: vibrant while the window is key, flatter when inactive.
+        effect.setState(NSVisualEffectState::FollowsWindowActiveState);
+        effect.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        frame_view.addSubview_positioned_relativeTo(
+            &effect,
+            NSWindowOrderingMode::Below,
+            Some(content),
+        );
+        true
     }
 
     pub fn trash(path: &Path) -> Result<PathBuf, String> {

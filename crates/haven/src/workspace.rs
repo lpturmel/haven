@@ -133,18 +133,32 @@ impl Workspace {
         for loc in initial {
             ws.add_tab(loc, false, window, cx);
         }
-        ws.active = active.min(ws.tabs.len() - 1);
+        // Focus the restored active tab (not just the first one) so key
+        // bindings reach the visible view.
+        ws.activate(active.min(ws.tabs.len() - 1), window, cx);
         subs.push(cx.on_focus_out(
             &ws.path_field.focus_handle(cx),
             window,
             |ws, _, window, cx| {
-                if ws.path_editing {
-                    // Refocus the file view so shortcuts keep working (e.g. after
-                    // the window was deactivated mid-edit).
-                    ws.end_path_edit(true, window, cx);
+                // gpui also reports focus-out when the window is deactivated;
+                // keep the edit then (like Finder's Go to Folder) so it is still
+                // there, focused, when the user comes back.
+                if ws.path_editing && window.is_window_active() {
+                    // Don't force focus back to the file view: focus may have
+                    // moved on purpose (filter field, palette). `end_path_edit`
+                    // still rescues focus left on nothing or on the hidden field.
+                    ws.end_path_edit(false, window, cx);
                 }
             },
         ));
+        // When the window comes back to the front with nothing focused, put
+        // focus on the active tab; otherwise no key binding can fire.
+        subs.push(cx.observe_window_activation(window, |ws, window, cx| {
+            if window.is_window_active() && window.focused(cx).is_none() {
+                let focus = ws.active_tab().read(cx).focus.clone();
+                window.focus(&focus);
+            }
+        }));
         // `add_tab` already pushed the initial tabs' subscriptions: keep them.
         ws._subs.extend(subs);
         refresh_start_data(cx);
@@ -377,7 +391,13 @@ impl Workspace {
         self.completion_ix = None;
         self.completion_task = None;
         self.path_error = None;
-        if refocus {
+        // The path field is no longer rendered once editing ends, so never
+        // leave focus on it (or on nothing): key bindings would stop firing.
+        let stranded = match window.focused(cx) {
+            None => true,
+            Some(f) => f == self.path_field.focus_handle(cx),
+        };
+        if refocus || stranded {
             let focus = self.active_tab().read(cx).focus.clone();
             window.focus(&focus);
         }
@@ -1189,6 +1209,8 @@ mod tests {
     fn init(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::store::init_test_env();
+            crate::actions::bind_keys(cx);
+            crate::text_field::bind_keys(cx);
             cx.set_global(crate::theme::Theme::dark());
             Store::init(cx);
             crate::icons::IconCache::init(cx);
@@ -1406,5 +1428,119 @@ mod tests {
             root.join("b.txt").exists(),
             "undo restored the trashed file"
         );
+    }
+
+    fn active_tab_focused(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+        ws.update_in(cx, |ws, window, cx| {
+            ws.active_tab().read(cx).focus.is_focused(window)
+        })
+    }
+
+    #[gpui::test]
+    async fn escape_key_closes_context_menu_not_selection(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        let tab = ws.read_with(cx, |ws, _| ws.active_tab().clone());
+        tab.update_in(cx, |t, window, cx| {
+            t.context_item(0, gpui::point(gpui::px(80.), gpui::px(120.)), window, cx)
+        });
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| assert!(ws.context_menu.is_some()));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| assert!(ws.context_menu.is_none()));
+        // Esc went to the menu, not to the list's ClearSelection.
+        assert_eq!(tab.read_with(cx, |t, _| t.selection.len()), 1);
+        assert!(active_tab_focused(&ws, cx));
+    }
+
+    #[gpui::test]
+    async fn restored_active_tab_gets_focus(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let locs = vec![
+            Location::Dir(root.clone()),
+            Location::Dir(root.join("projects")),
+        ];
+        let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(locs, 1, window, cx));
+        cx.run_until_parked();
+        assert_eq!(ws.read_with(cx, |ws, _| ws.active), 1);
+        assert!(active_tab_focused(&ws, cx));
+    }
+
+    #[gpui::test]
+    async fn ending_path_edit_never_strands_focus(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        ws.update_in(cx, |ws, window, cx| {
+            ws.begin_path_edit(window, cx);
+            assert!(ws.path_field.focus_handle(cx).is_focused(window));
+            ws.end_path_edit(false, window, cx);
+        });
+        assert!(active_tab_focused(&ws, cx));
+        // Shortcuts still fire: Cmd-L re-enters path editing.
+        cx.simulate_keystrokes("cmd-l");
+        cx.run_until_parked();
+        assert!(ws.read_with(cx, |ws, _| ws.path_editing));
+    }
+
+    #[gpui::test]
+    async fn moving_focus_to_filter_while_editing_path_keeps_it(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        // Focus listeners compare the focus of consecutive drawn frames (of an
+        // active window), so activate and draw after each step like the app.
+        cx.update(|window, _| window.activate_window());
+        draw(cx);
+        ws.update_in(cx, |ws, window, cx| ws.begin_path_edit(window, cx));
+        draw(cx);
+        cx.simulate_keystrokes("cmd-f");
+        draw(cx);
+        ws.update_in(cx, |ws, window, cx| {
+            assert!(!ws.path_editing, "leaving the path field ends editing");
+            assert!(
+                ws.filter_field
+                    .read(cx)
+                    .focus_handle_ref()
+                    .is_focused(window),
+                "the filter keeps the focus it was given"
+            );
+        });
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn path_edit_survives_window_deactivation(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        cx.update(|window, _| window.activate_window());
+        draw(cx);
+        ws.update_in(cx, |ws, window, cx| ws.begin_path_edit(window, cx));
+        draw(cx);
+        // Another app takes the front, then Haven comes back.
+        cx.deactivate_window();
+        draw(cx);
+        assert!(ws.read_with(cx, |ws, _| ws.path_editing));
+        cx.update(|window, _| window.activate_window());
+        draw(cx);
+        ws.update_in(cx, |ws, window, cx| {
+            assert!(ws.path_editing);
+            assert!(ws.path_field.focus_handle(cx).is_focused(window));
+        });
+        // Typing still works: Escape cancels and focus returns to the files.
+        cx.simulate_keystrokes("escape");
+        draw(cx);
+        assert!(!ws.read_with(cx, |ws, _| ws.path_editing));
+        assert!(active_tab_focused(&ws, cx));
     }
 }

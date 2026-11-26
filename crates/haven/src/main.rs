@@ -54,12 +54,16 @@ fn open_window(cx: &mut App, args: Vec<PathBuf>) -> WindowHandle<Workspace> {
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(16.), px(17.))),
             }),
-            window_background: WindowBackgroundAppearance::Blurred,
+            // Transparent, not `Blurred`: gpui's own blur view does not blur on
+            // current macOS (the backdrop shows through sharp). We install the
+            // native sidebar material ourselves below.
+            window_background: WindowBackgroundAppearance::Transparent,
             window_min_size: Some(size(px(900.), px(560.))),
             app_id: Some("dev.haven.app".into()),
             ..Default::default()
         },
         |window, cx| {
+            install_backdrop(window);
             let ws = cx.new(|cx| Workspace::new(tabs, active, window, cx));
             let focus = ws.read(cx).active_tab().read(cx).focus.clone();
             window.focus(&focus);
@@ -67,6 +71,21 @@ fn open_window(cx: &mut App, args: Vec<PathBuf>) -> WindowHandle<Workspace> {
         },
     )
     .expect("failed to open window")
+}
+
+/// Puts Finder's frosted sidebar material behind the window content.
+fn install_backdrop(window: &gpui::Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    if let RawWindowHandle::AppKit(h) = handle.as_raw() {
+        // SAFETY: gpui hands out the window's live content NSView.
+        let ok = unsafe { haven_macos::install_sidebar_material(h.ns_view.as_ptr()) };
+        if !ok {
+            eprintln!("haven: could not install the sidebar material");
+        }
+    }
 }
 
 /// Converts `file://` URLs (from Finder / `open`) to paths.

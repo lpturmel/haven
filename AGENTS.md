@@ -9,6 +9,7 @@ The design plan lives in `docs/PLAN.md`.
 - `crates/haven-macos`: objc2 / AppKit glue for file icons, trash and default-viewer registration.
 - `crates/haven`: the GPUI app (binary `haven`).
 - `scripts/bundle-macos.sh`: builds `target/bundle/Haven.app`.
+- `scripts/visual-check.sh`: bundles, launches and screenshots the app per view, and checks sidebar legibility (tier 3).
 
 ## Rules
 - Never do filesystem work on the UI thread. Use `cx.spawn` plus `cx.background_executor().spawn`.
@@ -17,12 +18,24 @@ The design plan lives in `docs/PLAN.md`.
 - Run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` before every commit.
 - Performance budgets live in `crates/*/tests/perf.rs`, which are `#[ignore]`d. Run them with `cargo test --release -p <crate> --test perf -- --ignored`.
 - To take screenshots, bundle the app first (`PROFILE=debug scripts/bundle-macos.sh`, then `open target/bundle/Haven.app`). The bundle id is `dev.haven.app`. The bare binary does not appear in the app list that screenshot tools use.
+- Before any visual check, make sure no other Haven is running (`pgrep -fl MacOS/haven`). Every build shares the bundle id, so screenshot tools attach to whichever instance came first, which may be a stale build. Launch with `open -n --env HAVEN_STATE_DIR=$(mktemp -d) target/bundle/Haven.app --args <folder>` so the validation never touches the real state in `~/Library/Application Support/Haven`.
+- The sidebar's frosted look comes from a native `NSVisualEffectView` (`.sidebar` material) installed behind gpui's content (`haven_macos::install_sidebar_material`). Don't switch back to gpui's `WindowBackgroundAppearance::Blurred`: on current macOS it only tints, so whatever is behind the window shows through sharp.
 
 ## Workflow: PRs and 3-tier validation
 1. Work on a feature branch and open a PR against `main`.
 2. **After creating a PR, start a fresh session (with no context from the authoring session) to validate the feature.** The validator runs all three tiers and posts the results as a PR comment:
    1. **Unit tests:** `cargo test --workspace`. The PR must add or extend tests for the logic it changes, mostly in `haven-core`.
    2. **Integration tests:** GPUI view tests using gpui `test-support` / `TestAppContext` for the view state it touches (navigation, selection, path bar, and so on), plus `cargo build --release`.
-   3. **Visual validation:** build and launch the app (`cargo run -p haven` or the bundled `Haven.app`) and drive it through the feature. Take screenshots that show the feature working, and attach them or describe them in the PR comment, including dark-mode look, blur and layout.
+   3. **Visual validation:**
+      - Run `scripts/visual-check.sh`. It must exit 0. It captures `target/visual/{start,list,grid,columns}.png` over the real desktop and fails if the sidebar is too bright for its text. Look at every capture.
+      - Then drive the app by hand (keyboard input needs Haven to be the key window, so a screen-control agent needs full-screen control) through the feature and this regression checklist:
+        - The sidebar is frosted: windows behind it are blurred, never readable. Its text is legible over a bright wallpaper. The content card is opaque and rounded, and the traffic lights don't overlap content.
+        - List view: Date, Size and Kind sit under their headers on every row, and rows span the full width (Columns view too).
+        - Path bar (⌘L): the completion dropdown paints above the page. Tab completes a unique prefix match. Enter navigates. A bad path shows an error.
+        - Right-click and Ctrl-click open the context menu in the first tab (not only in ⌘T tabs). Esc closes it.
+        - After switching to another app and back, shortcuts (⌘K, ⌘L) still work without clicking first.
+        - Folders refresh live in every tab when files change on disk.
+        - ⇧⌘N and rename select the renamed item. ⌘⌫ then ⌘Z restores it.
+      - Describe each screenshot in the PR comment.
 3. Fix whatever the validator finds on the same branch. Re-validate if the fixes are substantive.
 4. Agents may **create and merge PRs on their own** once all three tiers pass and CI (if any) is green. Squash-merge, then delete the branch.

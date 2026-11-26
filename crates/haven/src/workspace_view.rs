@@ -104,7 +104,7 @@ impl Workspace {
             .child(icon(icon_name).size(px(15.)).text_color(if active {
                 t.accent_text
             } else {
-                t.text_muted
+                t.sidebar_icon
             }))
             .child(div().flex_1().min_w_0().truncate().child(label));
         match path {
@@ -171,7 +171,7 @@ impl Workspace {
                         Store::update(cx, |s| s.toggle_section(key));
                         cx.notify();
                     }))
-                    .child(section_label(title, cx))
+                    .child(section_label(title, cx).text_color(t.sidebar_label))
                     .child(
                         icon(if collapsed {
                             "chevron-right"
@@ -179,7 +179,7 @@ impl Workspace {
                             "chevron-down"
                         })
                         .size(px(12.))
-                        .text_color(t.text_faint)
+                        .text_color(t.sidebar_label)
                         .invisible()
                         .group_hover("sec", |s| s.visible()),
                     ),
@@ -269,7 +269,7 @@ impl Workspace {
                             Store::update(cx, |s| s.toggle_sidebar_pin(&unpin));
                             cx.notify();
                         }))
-                        .child(icon("x").size(px(12.)).text_color(t.text_faint)),
+                        .child(icon("x").size(px(12.)).text_color(t.sidebar_label)),
                 )
                 .into_any_element()
             })
@@ -280,7 +280,7 @@ impl Workspace {
                     .px(px(8.))
                     .py(px(4.))
                     .text_size(px(11.))
-                    .text_color(t.text_faint)
+                    .text_color(t.sidebar_label)
                     .child("Drop folders here to pin")
                     .into_any_element(),
             ]
@@ -345,7 +345,7 @@ impl Workspace {
                                 .detach();
                                 let _ = ws;
                             }))
-                            .child(icon("arrow-up").size(px(12.)).text_color(t.text_faint)),
+                            .child(icon("arrow-up").size(px(12.)).text_color(t.sidebar_label)),
                     )
                 })
                 .into_any_element()
@@ -360,7 +360,7 @@ impl Workspace {
                 let active = active_loc == Location::Tag(tag.name.clone());
                 let name = tag.name.clone();
                 let color = if tag.color == TagColor::None {
-                    t.text_faint
+                    t.sidebar_label
                 } else {
                     t.tag(tag.color)
                 };
