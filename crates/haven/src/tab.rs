@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
@@ -125,10 +126,12 @@ pub struct Tab {
     type_buffer: String,
     type_at: Instant,
     pub preview: Preview,
-    preview_task: Option<Task<()>>,
+    preview_task: Option<PreviewJob>,
     pub column_root: Option<PathBuf>,
     pub column_cache: HashMap<PathBuf, Arc<Vec<Entry>>>,
     column_loading: HashSet<PathBuf>,
+    /// Columns whose folder couldn't be listed (e.g. permission denied).
+    pub column_errors: HashMap<PathBuf, String>,
     pub free_space: Option<u64>,
     size_control: Option<Arc<Control>>,
     pub sizing: bool,
@@ -169,6 +172,7 @@ impl Tab {
             column_root: None,
             column_cache: HashMap::new(),
             column_loading: HashSet::new(),
+            column_errors: HashMap::new(),
             free_space: None,
             size_control: None,
             sizing: false,
@@ -688,6 +692,36 @@ impl Tab {
         }
     }
 
+    /// Rows per Page Up/Down: 20 list rows, or a few grid rows.
+    pub fn page_rows(&self) -> isize {
+        if self.view == ViewMode::Grid { 4 } else { 20 }
+    }
+
+    /// Moves the cursor by `rows` rows: one item in list views, a whole row
+    /// of `grid_cols` items in the grid. In the grid, moving up from the
+    /// first row stays put, and moving down into a shorter last row lands
+    /// on its last item (Finder's behaviour).
+    pub fn move_rows(&mut self, rows: isize, extend: bool, cx: &mut Context<Self>) {
+        if self.view != ViewMode::Grid {
+            return self.move_cursor(rows, extend, cx);
+        }
+        let len = self.entries.len() as isize;
+        let cols = self.grid_cols.max(1) as isize;
+        let Some(c) = self.cursor.map(|c| c as isize) else {
+            return self.move_cursor(rows, extend, cx);
+        };
+        if len == 0 {
+            return;
+        }
+        let last_row = (len - 1) / cols;
+        let target_row = (c / cols + rows).clamp(0, last_row);
+        if target_row == c / cols {
+            return; // already on the first/last row
+        }
+        let target = (target_row * cols + c % cols).min(len - 1);
+        self.move_cursor(target - c, extend, cx);
+    }
+
     pub fn move_to_edge(&mut self, end: bool, cx: &mut Context<Self>) {
         if self.entries.is_empty() {
             return;
@@ -893,15 +927,27 @@ impl Tab {
             let task = cx.background_executor().spawn({
                 let dir = dir.clone();
                 async move {
-                    let mut e = list_dir(&dir, show_hidden).unwrap_or_default();
-                    sort::sort_entries(&mut e, &sort);
-                    e
+                    list_dir(&dir, show_hidden).map(|mut e| {
+                        sort::sort_entries(&mut e, &sort);
+                        e
+                    })
                 }
             });
             cx.spawn(async move |this, cx| {
-                let entries = task.await;
+                let listed = task.await;
                 let _ = this.update(cx, |tab, cx| {
                     tab.column_loading.remove(&dir);
+                    // An unreadable folder must say so, not look empty.
+                    let entries = match listed {
+                        Ok(e) => {
+                            tab.column_errors.remove(&dir);
+                            e
+                        }
+                        Err(e) => {
+                            tab.column_errors.insert(dir.clone(), e.to_string());
+                            Vec::new()
+                        }
+                    };
                     tab.column_cache.insert(dir, Arc::new(entries));
                     cx.notify();
                 });
@@ -922,13 +968,14 @@ impl Tab {
         };
         if entry.is_navigable() {
             self.navigate(Location::Dir(entry.path.clone()), true, cx);
-            if let Some(first) = self
-                .column_cache
-                .get(&entry.path)
-                .and_then(|v| v.first())
-                .map(|e| e.path.clone())
-            {
-                self.pending_select = vec![first];
+            // The peek listing was sorted with the parent's sort; the folder
+            // now uses its own, so pick its first item under that order.
+            if let Some(cached) = self.column_cache.get(&entry.path) {
+                let mut entries = cached.as_ref().clone();
+                sort::sort_entries(&mut entries, &self.sort);
+                if let Some(first) = entries.first() {
+                    self.pending_select = vec![first.path.clone()];
+                }
             }
         }
     }
@@ -970,7 +1017,7 @@ impl Tab {
         if entry.is_dir {
             let path = entry.path.clone();
             self.preview = Preview::Folder { entry, count: None };
-            self.preview_task = Some(cx.spawn(async move |this, cx| {
+            self.preview_task = Some(PreviewJob::new(cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(40))
                     .await;
@@ -984,7 +1031,7 @@ impl Tab {
                         cx.notify();
                     }
                 });
-            }));
+            })));
             return;
         }
         if is_image_ext(&entry.ext) || is_native_image_ext(&entry.ext) {
@@ -996,67 +1043,111 @@ impl Tab {
         let (file_size, file_modified) = (entry.size, entry.modified);
         self.preview = Preview::Loading;
         let mono = font(MONO_FONT);
-        self.preview_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(35))
-                .await;
-            let loaded = cx
-                .background_executor()
-                .spawn(load_text(path.clone()))
-                .await;
-            let Some((text, truncated, bytes)) = loaded else {
-                let _ = this.update(cx, |tab, cx| {
-                    tab.preview = Preview::Info(entry);
-                    cx.notify();
-                });
-                return;
-            };
-            let first_line = text.lines().next().map(str::to_string);
-            let lang = haven_highlight::detect(&path, first_line.as_deref());
-            let text = Arc::new(text);
-            let lines: Arc<Vec<SharedString>> = Arc::new(
-                text.split('\n')
-                    .take(50_000)
-                    .map(|l| SharedString::from(l.to_string()))
-                    .collect(),
-            );
-            let _ = this.update(cx, |tab, cx| {
-                tab.preview_scroll = UniformListScrollHandle::new();
-                tab.preview = Preview::Text(TextPreview {
-                    path: path.clone(),
-                    lines: lines.clone(),
-                    runs: None,
-                    lang: lang.map(|l| l.name()),
-                    truncated,
-                    bytes,
-                    file_size,
-                    file_modified,
-                });
-                cx.notify();
-            });
-            let Some(lang) = lang else { return };
-            if text.len() > 1_500_000 {
-                return;
-            }
-            let spans = cx
-                .background_executor()
-                .spawn({
-                    let text = text.clone();
-                    async move { haven_highlight::highlight(lang, &text, None) }
-                })
-                .await;
-            let Some(spans) = spans else { return };
-            let _ = this.update(cx, |tab, cx| {
-                let t = theme(cx).clone();
-                let runs = build_runs(&lines, &spans, &mono, t.text, |s| t.syntax(s));
-                if let Preview::Text(tp) = &mut tab.preview
-                    && tp.path == path
-                {
-                    tp.runs = Some(Arc::new(runs));
-                    cx.notify();
+        let cancel = Arc::new(AtomicUsize::new(0));
+        let highlight_cancel = cancel.clone();
+        self.preview_task = Some(PreviewJob {
+            cancel,
+            _task: cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(35))
+                    .await;
+                let loaded = cx
+                    .background_executor()
+                    .spawn(load_text(path.clone()))
+                    .await;
+                let Some((text, truncated, bytes)) = loaded else {
+                    let _ = this.update(cx, |tab, cx| {
+                        tab.preview = Preview::Info(entry);
+                        cx.notify();
+                    });
+                    return;
+                };
+                let first_line = text.lines().next().map(str::to_string);
+                let lang = haven_highlight::detect(&path, first_line.as_deref());
+                let text = Arc::new(text);
+                // Cap what gets shaped: at most MAX_PREVIEW_LINES lines, each cut
+                // to MAX_LINE_BYTES (a minified 1 MB line would be shaped every
+                // frame, and the pane doesn't scroll horizontally anyway).
+                let mut lines_vec = Vec::new();
+                for line in text.split('\n').take(MAX_PREVIEW_LINES) {
+                    if line.len() > MAX_LINE_BYTES {
+                        let mut end = MAX_LINE_BYTES;
+                        while !line.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        lines_vec.push(SharedString::from(format!("{}…", &line[..end])));
+                    } else {
+                        lines_vec.push(SharedString::from(line.to_string()));
+                    }
                 }
-            });
-        }));
+                let truncated = truncated || text.split('\n').nth(MAX_PREVIEW_LINES).is_some();
+                let lines: Arc<Vec<SharedString>> = Arc::new(lines_vec);
+                let _ = this.update(cx, |tab, cx| {
+                    tab.preview_scroll = UniformListScrollHandle::new();
+                    tab.preview = Preview::Text(TextPreview {
+                        path: path.clone(),
+                        lines: lines.clone(),
+                        runs: None,
+                        lang: lang.map(|l| l.name()),
+                        truncated,
+                        bytes,
+                        file_size,
+                        file_modified,
+                    });
+                    cx.notify();
+                });
+                let Some(lang) = lang else { return };
+                if text.len() > 1_500_000 {
+                    return;
+                }
+                let spans = cx
+                    .background_executor()
+                    .spawn({
+                        let text = text.clone();
+                        // Cancelled when the user moves on (the job is dropped).
+                        let cancel = highlight_cancel.clone();
+                        async move { haven_highlight::highlight(lang, &text, Some(&cancel)) }
+                    })
+                    .await;
+                let Some(spans) = spans else { return };
+                let _ = this.update(cx, |tab, cx| {
+                    let t = theme(cx).clone();
+                    let runs = build_runs(&lines, &spans, &mono, t.text, |s| t.syntax(s));
+                    if let Preview::Text(tp) = &mut tab.preview
+                        && tp.path == path
+                    {
+                        tp.runs = Some(Arc::new(runs));
+                        cx.notify();
+                    }
+                });
+            }),
+        });
+    }
+}
+
+const MAX_PREVIEW_LINES: usize = 50_000;
+const MAX_LINE_BYTES: usize = 4096;
+
+/// The running preview load. Dropping it (new selection, navigation) cancels
+/// the task and any syntax highlighting in flight, which otherwise keeps
+/// running on a background thread.
+struct PreviewJob {
+    _task: Task<()>,
+    cancel: Arc<AtomicUsize>,
+}
+
+impl PreviewJob {
+    fn new(task: Task<()>) -> Self {
+        PreviewJob {
+            _task: task,
+            cancel: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl Drop for PreviewJob {
+    fn drop(&mut self) {
+        self.cancel.store(1, Ordering::Relaxed);
     }
 }
 
@@ -1342,5 +1433,73 @@ mod tests {
             assert_eq!(t.dir(), Some(root.as_path()));
             assert_eq!(t.selection.len(), 3);
         });
+    }
+
+    #[gpui::test]
+    async fn grid_arrow_keys_move_by_rows(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        for i in 0..7 {
+            std::fs::write(dir.join(format!("f{i}")), b"").unwrap();
+        }
+        let tab = cx.new(|cx| Tab::new(Location::Dir(dir.clone()), cx));
+        cx.run_until_parked();
+        tab.update(cx, |t, cx| {
+            t.view = ViewMode::Grid;
+            t.grid_cols = 3;
+            t.select_only(1, cx);
+            t.move_rows(-1, false, cx); // first row: stays
+            assert_eq!(t.cursor, Some(1));
+            t.move_rows(1, false, cx);
+            assert_eq!(t.cursor, Some(4));
+            t.move_rows(1, false, cx); // short last row: its last item
+            assert_eq!(t.cursor, Some(6));
+            t.move_rows(1, false, cx); // already on the last row
+            assert_eq!(t.cursor, Some(6));
+            t.select_only(1, cx);
+            t.move_rows(1, true, cx); // shift+down extends by a row
+            assert_eq!(t.selection.len(), 4);
+        });
+    }
+
+    #[gpui::test]
+    async fn preview_caps_lines_and_says_so(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let mut text = "x".repeat(10_000);
+        text.push('\n');
+        text.push_str(&"line\n".repeat(MAX_PREVIEW_LINES + 10));
+        std::fs::write(dir.join("big.txt"), text).unwrap();
+        let tab = cx.new(|cx| Tab::new(Location::Dir(dir.clone()), cx));
+        cx.run_until_parked();
+        tab.update(cx, |t, cx| t.select_only(0, cx));
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        tab.read_with(cx, |t, _| match &t.preview {
+            Preview::Text(tp) => {
+                assert!(tp.truncated, "more lines than shown");
+                assert_eq!(tp.lines.len(), MAX_PREVIEW_LINES);
+                assert!(tp.lines[0].len() <= MAX_LINE_BYTES + '…'.len_utf8());
+                assert!(tp.lines[0].ends_with('…'));
+            }
+            _ => panic!("expected text preview"),
+        });
+    }
+
+    #[gpui::test]
+    async fn unreadable_column_reports_an_error(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        init(cx);
+        let root = fixture();
+        let locked = root.join("beta");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let tab = cx.new(|cx| Tab::new(Location::Dir(root.clone()), cx));
+        cx.run_until_parked();
+        tab.update(cx, |t, cx| {
+            let _ = t.column_listing(&locked, cx);
+        });
+        cx.run_until_parked();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tab.read_with(cx, |t, _| assert!(t.column_errors.contains_key(&locked)));
     }
 }

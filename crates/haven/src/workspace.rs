@@ -375,11 +375,31 @@ impl Workspace {
     fn reload_dirs(&mut self, dirs: &[PathBuf], cx: &mut Context<Self>) {
         for tab in &self.tabs {
             tab.update(cx, |t, cx| {
-                let hit = t.dir().is_some_and(|d| dirs.iter().any(|x| x == d));
-                // Columns view also caches ancestor/peek listings.
-                for d in dirs {
-                    t.column_cache.remove(d);
+                // Deleting a folder is reported for its *parent* only: a tab
+                // showing the folder (or anything inside it) moves up to the
+                // nearest folder that still exists, like Finder.
+                // (Checked on every event: the reported parent may be a
+                // canonical path that doesn't prefix-match the tab's own.)
+                if let Some(dir) = t.dir().map(Path::to_path_buf)
+                    && !dir.is_dir()
+                {
+                    let mut up = dir.parent();
+                    while let Some(p) = up
+                        && !p.is_dir()
+                    {
+                        up = p.parent();
+                    }
+                    if let Some(p) = up {
+                        t.navigate(Location::Dir(p.to_path_buf()), true, cx);
+                    }
+                    cx.notify();
+                    return;
                 }
+                let hit = t.dir().is_some_and(|d| dirs.iter().any(|x| x == d));
+                // Columns view also caches ancestor/peek listings, including
+                // subfolders that may just have been removed or renamed.
+                t.column_cache
+                    .retain(|k, _| !dirs.iter().any(|d| k.starts_with(d)));
                 if hit {
                     t.reload(cx);
                 }
@@ -1804,5 +1824,70 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(ws.read_with(cx, |ws, _| ws.undo_stack.len()), 1);
+    }
+
+    #[gpui::test]
+    async fn deleting_the_shown_folder_moves_the_tab_up(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.join("projects/haven")));
+        std::fs::remove_dir_all(root.join("projects/haven")).unwrap();
+        // The watcher reports the parent of a deleted folder.
+        ws.update(cx, |ws, cx| ws.reload_dirs(&[root.join("projects")], cx));
+        cx.run_until_parked();
+        let dir = ws.read_with(cx, |ws, cx| {
+            ws.active_tab().read(cx).dir().unwrap().to_path_buf()
+        });
+        assert_eq!(dir, root.join("projects"));
+    }
+
+    #[gpui::test]
+    async fn conflict_dialog_takes_enter_and_blocks_the_palette(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        std::fs::create_dir(root.join("dst")).unwrap();
+        std::fs::write(root.join("dst/readme.md"), b"other").unwrap();
+        let (ws, cx) = open(cx, Location::Dir(root.join("dst")));
+        ws.update_in(cx, |ws, window, cx| {
+            ws.clipboard = Some((vec![root.join("projects/readme.md")], false));
+            ws.paste(window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-k cmd-p");
+        ws.read_with(cx, |ws, _| {
+            assert!(matches!(ws.overlay, Some(Overlay::Conflict { .. })))
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| assert!(ws.overlay.is_none()));
+        // Enter = Keep Both.
+        assert_eq!(std::fs::read(root.join("dst/readme.md")).unwrap(), b"other");
+        assert_eq!(
+            std::fs::read(root.join("dst/readme copy.md")).unwrap(),
+            b"# readme"
+        );
+    }
+
+    #[gpui::test]
+    async fn tag_editor_keeps_an_existing_tags_colour(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.join("projects")));
+        let tab = ws.read_with(cx, |ws, _| ws.active_tab().clone());
+        tab.update(cx, |t, cx| {
+            let ix = t
+                .entries
+                .iter()
+                .position(|e| e.name == "readme.md")
+                .unwrap();
+            t.select_only(ix, cx);
+        });
+        ws.update_in(cx, |ws, window, cx| {
+            crate::overlays::open_tags(ws, window, cx)
+        });
+        cx.simulate_keystrokes("r e d enter");
+        cx.run_until_parked();
+        let tags = haven_core::tags::read_tags(&root.join("projects/readme.md"));
+        assert_eq!(tags, vec![Tag::new("Red", haven_core::TagColor::Red)]);
     }
 }

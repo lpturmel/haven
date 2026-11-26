@@ -40,26 +40,11 @@ impl Render for Tab {
             .track_focus(&self.focus)
             .size_full()
             .flex()
-            .on_action(cx.listener(|tab, _: &SelectNext, _, cx| {
-                let step = if tab.view == ViewMode::Grid {
-                    tab.grid_cols as isize
-                } else {
-                    1
-                };
-                tab.move_cursor(step, false, cx)
-            }))
-            .on_action(cx.listener(|tab, _: &SelectPrev, _, cx| {
-                let step = if tab.view == ViewMode::Grid {
-                    tab.grid_cols as isize
-                } else {
-                    1
-                };
-                tab.move_cursor(-step, false, cx)
-            }))
-            .on_action(cx.listener(|tab, _: &SelectNextExtend, _, cx| tab.move_cursor(1, true, cx)))
-            .on_action(
-                cx.listener(|tab, _: &SelectPrevExtend, _, cx| tab.move_cursor(-1, true, cx)),
-            )
+            // Up/Down move by rows (a whole grid row in grid view).
+            .on_action(cx.listener(|tab, _: &SelectNext, _, cx| tab.move_rows(1, false, cx)))
+            .on_action(cx.listener(|tab, _: &SelectPrev, _, cx| tab.move_rows(-1, false, cx)))
+            .on_action(cx.listener(|tab, _: &SelectNextExtend, _, cx| tab.move_rows(1, true, cx)))
+            .on_action(cx.listener(|tab, _: &SelectPrevExtend, _, cx| tab.move_rows(-1, true, cx)))
             .on_action(cx.listener(|tab, _: &SelectLeft, _, cx| match tab.view {
                 ViewMode::Grid => tab.move_cursor(-1, false, cx),
                 ViewMode::Columns => tab.column_left(cx),
@@ -72,8 +57,12 @@ impl Render for Tab {
             }))
             .on_action(cx.listener(|tab, _: &SelectFirst, _, cx| tab.move_to_edge(false, cx)))
             .on_action(cx.listener(|tab, _: &SelectLast, _, cx| tab.move_to_edge(true, cx)))
-            .on_action(cx.listener(|tab, _: &PageDown, _, cx| tab.move_cursor(20, false, cx)))
-            .on_action(cx.listener(|tab, _: &PageUp, _, cx| tab.move_cursor(-20, false, cx)))
+            .on_action(
+                cx.listener(|tab, _: &PageDown, _, cx| tab.move_rows(tab.page_rows(), false, cx)),
+            )
+            .on_action(
+                cx.listener(|tab, _: &PageUp, _, cx| tab.move_rows(-tab.page_rows(), false, cx)),
+            )
             .on_action(cx.listener(|tab, _: &SelectAllItems, _, cx| tab.select_all(cx)))
             .on_action(cx.listener(|tab, _: &ClearSelection, _, cx| tab.clear_selection(cx)))
             .on_action(

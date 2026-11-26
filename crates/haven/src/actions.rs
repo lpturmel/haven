@@ -64,6 +64,7 @@ actions!(
         MakeDefaultViewer,
         RestoreFinder,
         Dismiss,
+        ConfirmModal,
     ]
 );
 
@@ -121,6 +122,9 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("escape", Dismiss, ws),
+        // Enter takes the primary button of the conflict / confirm dialogs
+        // (they hold focus on the workspace, so the file view's Enter is out).
+        KeyBinding::new("enter", ConfirmModal, ws),
         KeyBinding::new("cmd-t", NewTab, ws),
         KeyBinding::new("cmd-w", CloseTab, ws),
         KeyBinding::new("cmd-shift-t", ReopenClosedTab, ws),

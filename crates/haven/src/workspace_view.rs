@@ -1108,6 +1108,11 @@ impl Render for Workspace {
                 cx.quit()
             }))
             .on_action(cx.listener(|ws, _: &Dismiss, window, cx| ws.close_overlay(window, cx)))
+            .on_action(cx.listener(|ws, _: &ConfirmModal, window, cx| {
+                if !overlays::confirm_modal(ws, window, cx) {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|ws, _: &NewTab, window, cx| ws.add_tab(Location::Start, true, window, cx)))
             .on_action(cx.listener(|ws, _: &CloseTab, window, cx| ws.close_tab(ws.active, window, cx)))
             .on_action(cx.listener(|ws, _: &ReopenClosedTab, window, cx| ws.reopen_closed(window, cx)))

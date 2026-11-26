@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use ignore::{WalkBuilder, WalkState};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32Str};
+use unicode_segmentation::UnicodeSegmentation;
 
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
@@ -28,7 +29,10 @@ pub struct FuzzyMatch {
 }
 
 pub struct FuzzyFinder {
-    nucleo: Nucleo<(PathBuf, bool)>,
+    /// (path, is_dir, relative path as displayed). The display string is
+    /// kept: nucleo's haystack keeps only the first char of each grapheme, so
+    /// rebuilding names from it drops accents (`café` -> `cafe`).
+    nucleo: Nucleo<(PathBuf, bool, String)>,
     root: PathBuf,
     cancel: Arc<AtomicBool>,
     walking: Arc<AtomicBool>,
@@ -93,7 +97,9 @@ impl FuzzyFinder {
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .into_owned();
-                    injector.push((path, is_dir), |_, cols| cols[0] = rel.as_str().into());
+                    injector.push((path, is_dir, rel), |item, cols| {
+                        cols[0] = item.2.as_str().into()
+                    });
                     f.fetch_add(1, Ordering::Relaxed);
                     WalkState::Continue
                 })
@@ -158,15 +164,31 @@ impl FuzzyFinder {
                 indices.sort_unstable();
                 indices.dedup();
             }
+            let rel = item.data.2.clone();
             out.push(FuzzyMatch {
+                indices: grapheme_to_char_indices(&rel, &indices),
                 path: item.data.0.clone(),
-                rel: hay.to_string(),
-                indices,
+                rel,
                 is_dir: item.data.1,
             });
         }
         out
     }
+}
+
+/// nucleo reports matches per grapheme; the UI highlights chars. Expands each
+/// matched grapheme to all of its chars (e.g. `e` + combining accent).
+fn grapheme_to_char_indices(text: &str, graphemes: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut char_ix = 0u32;
+    for (g, grapheme) in text.graphemes(true).enumerate() {
+        let n = grapheme.chars().count() as u32;
+        if graphemes.binary_search(&(g as u32)).is_ok() {
+            out.extend(char_ix..char_ix + n);
+        }
+        char_ix += n;
+    }
+    out
 }
 
 impl Drop for FuzzyFinder {
@@ -214,5 +236,31 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         f.tick();
         assert!(f.results(10).iter().all(|r| !r.rel.ends_with(".log")));
+    }
+
+    #[test]
+    fn keeps_combining_characters_in_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nfd = "cafe\u{301}.txt"; // "café" with a combining accent
+        std::fs::write(root.join(nfd), b"").unwrap();
+        let mut f = FuzzyFinder::new(root, false, false, Arc::new(|| {}));
+        f.set_query("caf");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (f.is_walking() || f.tick()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let got = f.results(10);
+        assert_eq!(got.len(), 1);
+        // APFS may store the name in either normalization; it must not lose
+        // the accent either way.
+        assert!(got[0].rel.contains('\u{301}') || got[0].rel.contains('é'));
+        assert_eq!(got[0].indices, [0, 1, 2]);
+    }
+
+    #[test]
+    fn grapheme_indices_expand_to_all_chars() {
+        assert_eq!(grapheme_to_char_indices("e\u{301}x", &[0]), [0, 1]);
+        assert_eq!(grapheme_to_char_indices("e\u{301}x", &[1]), [2]);
     }
 }

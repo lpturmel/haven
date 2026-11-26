@@ -2528,6 +2528,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "unicode-segmentation",
  "xattr 1.7.0",
 ]
 

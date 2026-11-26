@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use gpui::{
     Action, AnyElement, App, AppContext, Context, Entity, Focusable, FontWeight, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point, SharedString,
-    StatefulInteractiveElement, Styled, Task, Window, anchored, deferred, div,
-    prelude::FluentBuilder, px,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point, ScrollHandle,
+    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Task,
+    UniformListScrollHandle, Window, anchored, deferred, div, prelude::FluentBuilder, px,
+    uniform_list,
 };
 use haven_core::fuzzy::{FuzzyFinder, FuzzyMatch};
 use haven_core::ops::{BulkRename, CaseChange, Conflict, OpKind};
@@ -437,6 +438,8 @@ pub struct PaletteState {
     pub items: Vec<PaletteItem>,
     pub matches: Vec<usize>,
     pub selected: usize,
+    /// Keeps the selected row visible while moving with ↑↓.
+    pub scroll: ScrollHandle,
 }
 
 pub struct FuzzyState {
@@ -444,6 +447,10 @@ pub struct FuzzyState {
     pub finder: FuzzyFinder,
     pub results: Vec<FuzzyMatch>,
     pub selected: usize,
+    /// The results are virtualized; this keeps the selection in view.
+    pub scroll: UniformListScrollHandle,
+    /// Results need refreshing (new query) even if nucleo reports no change.
+    pub stale: bool,
     pub _ticker: Task<()>,
 }
 
@@ -657,7 +664,44 @@ fn commands(cx: &App) -> Vec<PaletteItem> {
     items
 }
 
+/// The conflict and confirm dialogs are modal: Enter takes their primary
+/// button, and nothing else (palette, fuzzy find) may replace them, or a
+/// pending transfer would silently never run.
+pub fn modal_open(ws: &Workspace) -> bool {
+    matches!(
+        ws.overlay,
+        Some(Overlay::Conflict { .. }) | Some(Overlay::Confirm { .. })
+    )
+}
+
+/// Runs the primary button of an open modal. Returns false if none is open.
+pub fn confirm_modal(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> bool {
+    match &ws.overlay {
+        Some(Overlay::Conflict {
+            kind,
+            sources,
+            dest,
+            ..
+        }) => {
+            let (kind, sources, dest) = (*kind, sources.clone(), dest.clone());
+            ws.close_overlay(window, cx);
+            ws.run_transfer(kind, sources, dest, Conflict::KeepBoth, cx);
+            true
+        }
+        Some(Overlay::Confirm { action, .. }) => {
+            let action = action.boxed_clone();
+            ws.overlay = None;
+            ws.dispatch_menu_action(action, window, cx);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn open_palette(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if modal_open(ws) {
+        return;
+    }
     let field = cx.new(|cx| TextField::new("Type a command, place or tag…", cx));
     ws.subscribe_overlay_field(&field, window, cx);
     window.focus(&field.focus_handle(cx));
@@ -668,11 +712,15 @@ pub fn open_palette(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Wo
         items,
         matches,
         selected: 0,
+        scroll: ScrollHandle::new(),
     }));
     cx.notify();
 }
 
 pub fn open_fuzzy(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if modal_open(ws) {
+        return;
+    }
     let root = ws
         .active_tab()
         .read(cx)
@@ -699,7 +747,10 @@ pub fn open_fuzzy(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Work
                     let Some(Overlay::Fuzzy(f)) = &mut ws.overlay else {
                         return false;
                     };
-                    if f.finder.tick() || f.results.is_empty() {
+                    // (Not `|| results.is_empty()`: a query with no match
+                    // would then re-render the window 30 times a second.)
+                    if f.finder.tick() || f.stale {
+                        f.stale = false;
                         f.results = f.finder.results(200);
                         if f.selected >= f.results.len() {
                             f.selected = 0;
@@ -719,6 +770,8 @@ pub fn open_fuzzy(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Work
         finder,
         results: Vec::new(),
         selected: 0,
+        scroll: UniformListScrollHandle::new(),
+        stale: true,
         _ticker: ticker,
     }));
     cx.notify();
@@ -790,9 +843,13 @@ pub fn handle_overlay_event(
             TextFieldEvent::Down => {
                 // Only the first PALETTE_ROWS matches are rendered.
                 let shown = p.matches.len().min(PALETTE_ROWS);
-                p.selected = (p.selected + 1).min(shown.saturating_sub(1))
+                p.selected = (p.selected + 1).min(shown.saturating_sub(1));
+                p.scroll.scroll_to_item(p.selected);
             }
-            TextFieldEvent::Up => p.selected = p.selected.saturating_sub(1),
+            TextFieldEvent::Up => {
+                p.selected = p.selected.saturating_sub(1);
+                p.scroll.scroll_to_item(p.selected);
+            }
             TextFieldEvent::Submit => {
                 if let Some(&ix) = p.matches.get(p.selected) {
                     let action = p.items[ix].action.boxed_clone();
@@ -807,15 +864,22 @@ pub fn handle_overlay_event(
                 let q = f.field.read(cx).text().to_string();
                 f.finder.set_query(&q);
                 f.selected = 0;
+                f.stale = true;
+                f.scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
             TextFieldEvent::Down => {
-                f.selected = (f.selected + 1).min(f.results.len().saturating_sub(1))
+                f.selected = (f.selected + 1).min(f.results.len().saturating_sub(1));
+                // Non-strict: scrolls only when the row is out of view.
+                f.scroll.scroll_to_item(f.selected, ScrollStrategy::Bottom);
             }
-            TextFieldEvent::Up => f.selected = f.selected.saturating_sub(1),
+            TextFieldEvent::Up => {
+                f.selected = f.selected.saturating_sub(1);
+                f.scroll.scroll_to_item(f.selected, ScrollStrategy::Top);
+            }
             TextFieldEvent::Submit => {
                 if let Some(m) = f.results.get(f.selected) {
-                    let path = m.path.clone();
-                    ws.navigate_to(&path, window, cx);
+                    let (path, is_dir) = (m.path.clone(), m.is_dir);
+                    reveal_found(ws, path, is_dir, window, cx);
                 }
             }
             _ => {}
@@ -850,7 +914,15 @@ pub fn handle_overlay_event(
             if let TextFieldEvent::Submit = ev {
                 let name = t.field.read(cx).text().trim().to_string();
                 if !name.is_empty() {
-                    let tag = Tag::new(name, t.color);
+                    // An existing tag keeps its colour; the picker only
+                    // colours new tags (else Finder and Haven disagree).
+                    // Same for its spelling ("red" applies the existing "Red").
+                    let tag = Store::get(cx)
+                        .tags
+                        .iter()
+                        .find(|k| k.name.eq_ignore_ascii_case(&name))
+                        .cloned()
+                        .unwrap_or_else(|| Tag::new(name, t.color));
                     ws.apply_tag(tag, true, cx);
                     t_clear(ws, cx);
                 }
@@ -930,6 +1002,69 @@ fn field_box(field: &Entity<TextField>, icon_name: &str, error: bool, cx: &App) 
         .text_color(t.text)
         .child(icon(icon_name).size(px(15.)).text_color(t.text_faint))
         .child(field.clone())
+}
+
+/// Opens a fuzzy-find hit exactly where it was found. (Not via the path
+/// resolver: that would follow symlinks, jump `/tmp/x` to `/private/tmp/x`
+/// and expand `$`/`~` in real file names.)
+fn reveal_found(
+    ws: &mut Workspace,
+    path: PathBuf,
+    is_dir: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let tab = ws.active_tab().clone();
+    tab.update(cx, |t, cx| {
+        if is_dir {
+            t.navigate(crate::tab::Location::Dir(path), true, cx);
+        } else if let Some(parent) = path.parent() {
+            t.reveal(parent.to_path_buf(), vec![path.clone()], cx);
+        }
+    });
+    ws.close_overlay(window, cx);
+    window.focus(&tab.read(cx).focus.clone());
+}
+
+fn fuzzy_row(ws: &Workspace, row: usize, cx: &mut Context<Workspace>) -> AnyElement {
+    let t = theme(cx).clone();
+    let Some(Overlay::Fuzzy(f)) = &ws.overlay else {
+        return div().into_any_element();
+    };
+    let Some(m) = f.results.get(row) else {
+        return div().into_any_element();
+    };
+    let (path, is_dir) = (m.path.clone(), m.is_dir);
+    let item =
+        div()
+            .id(("fz", row))
+            .w_full()
+            .h(px(28.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .rounded(px(6.))
+            .text_size(px(13.))
+            .when(row == f.selected, |d| d.bg(t.selection))
+            .hover(|s| s.bg(t.hover))
+            .on_click(cx.listener(move |ws, _, window, cx| {
+                reveal_found(ws, path.clone(), is_dir, window, cx)
+            }))
+            .child(
+                icon(if m.is_dir { "folder" } else { "file" })
+                    .size(px(14.))
+                    .text_color(if m.is_dir { t.folder } else { t.text_muted }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(highlighted(&m.rel, &m.indices, t.text_muted, t.text)),
+            );
+    // uniform_list rows need an explicit width to span the list.
+    div().w_full().px(px(6.)).child(item).into_any_element()
 }
 
 fn highlighted(text: &str, indices: &[u32], base: Hsla, hl: Hsla) -> AnyElement {
@@ -1030,49 +1165,14 @@ pub fn render_overlay(
                         .id("pal-list")
                         .max_h(px(420.))
                         .overflow_y_scroll()
+                        .track_scroll(&p.scroll)
                         .py(px(6.))
                         .children(rows),
                 )
                 .into_any_element()
         }
         Overlay::Fuzzy(f) => {
-            let results = &f.results;
-            let selected = f.selected;
-            let rows: Vec<AnyElement> = results
-                .iter()
-                .enumerate()
-                .map(|(row, m)| {
-                    let path = m.path.clone();
-                    div()
-                        .id(("fz", row))
-                        .h(px(28.))
-                        .mx(px(6.))
-                        .px(px(10.))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .rounded(px(6.))
-                        .text_size(px(13.))
-                        .when(row == selected, |d| d.bg(t.selection))
-                        .hover(|s| s.bg(t.hover))
-                        .on_click(
-                            cx.listener(move |ws, _, window, cx| ws.navigate_to(&path, window, cx)),
-                        )
-                        .child(
-                            icon(if m.is_dir { "folder" } else { "file" })
-                                .size(px(14.))
-                                .text_color(if m.is_dir { t.folder } else { t.text_muted }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .child(highlighted(&m.rel, &m.indices, t.text_muted, t.text)),
-                        )
-                        .into_any_element()
-                })
-                .collect();
+            let count = f.results.len();
             let status = format!(
                 "{} of {} {}",
                 f.finder.matched_count(),
@@ -1091,12 +1191,16 @@ pub fn render_overlay(
                 )
                 .child(div().h(px(1.)).bg(t.divider))
                 .child(
-                    div()
-                        .id("fz-list")
-                        .h(px(400.))
-                        .overflow_y_scroll()
-                        .py(px(6.))
-                        .children(rows),
+                    uniform_list(
+                        "fz-list",
+                        count,
+                        cx.processor(|ws, range: std::ops::Range<usize>, _window, cx| {
+                            range.map(|row| fuzzy_row(ws, row, cx)).collect::<Vec<_>>()
+                        }),
+                    )
+                    .track_scroll(f.scroll.clone())
+                    .h(px(400.))
+                    .py(px(6.)),
                 )
                 .child(
                     div()

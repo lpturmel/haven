@@ -28,9 +28,11 @@ pub fn render(tab: &mut Tab, window: &mut Window, cx: &mut Context<Tab>) -> AnyE
     for (i, ancestor) in chain.iter().enumerate() {
         let highlight = chain.get(i + 1).cloned().or_else(|| dir.clone());
         let listing = tab.column_listing(ancestor, cx);
+        let error = tab.column_errors.get(ancestor).cloned();
         columns.push(static_column(
             ancestor.clone(),
             listing,
+            error,
             highlight,
             false,
             cx,
@@ -72,7 +74,8 @@ pub fn render(tab: &mut Tab, window: &mut Window, cx: &mut Context<Tab>) -> AnyE
     let trailing: AnyElement = match tab.cursor_entry().cloned() {
         Some(e) if e.is_navigable() && tab.selection.len() == 1 => {
             let listing = tab.column_listing(&e.path, cx);
-            static_column(e.path.clone(), listing, None, true, cx)
+            let error = tab.column_errors.get(&e.path).cloned();
+            static_column(e.path.clone(), listing, error, None, true, cx)
         }
         Some(_) => div()
             .flex_1()
@@ -108,6 +111,7 @@ fn column_frame(id: impl Into<SharedString>, cx: &Context<Tab>) -> gpui::Statefu
 fn static_column(
     dir: PathBuf,
     listing: Option<Arc<Vec<Entry>>>,
+    error: Option<String>,
     highlight: Option<PathBuf>,
     peek: bool,
     cx: &mut Context<Tab>,
@@ -116,6 +120,11 @@ fn static_column(
         return column_frame(SharedString::from(format!("col-{}", dir.display())), cx)
             .into_any_element();
     };
+    if let Some(err) = error {
+        return column_frame(SharedString::from(format!("col-{}", dir.display())), cx)
+            .child(crate::ui::empty_state("triangle-alert", err, cx))
+            .into_any_element();
+    }
     let id = SharedString::from(format!("col-{}", dir.display()));
     let count = entries.len();
     column_frame(id.clone(), cx)

@@ -461,6 +461,14 @@ fn push_span(
 
 /// Normalizes text for display: strips `\r` and expands tabs to 4 spaces.
 pub fn normalize(text: &str) -> String {
+    // Classic Mac line endings: a lone CR is a line break, not noise.
+    let unified;
+    let text = if text.contains('\r') {
+        unified = text.replace("\r\n", "\n").replace('\r', "\n");
+        unified.as_str()
+    } else {
+        text
+    };
     let mut out = String::with_capacity(text.len());
     for line in text.split('\n') {
         if !out.is_empty() || line.as_ptr() != text.as_ptr() {
@@ -553,5 +561,8 @@ mod tests {
     fn normalize_expands_tabs_and_strips_cr() {
         assert_eq!(normalize("a\tb\r\n\tc"), "a   b\n    c");
         assert_eq!(normalize(""), "");
+        // Classic-Mac CR-only files keep their lines.
+        assert_eq!(normalize("a\rb\rc"), "a\nb\nc");
+        assert_eq!(normalize("a\r\n\rb"), "a\n\nb");
     }
 }
