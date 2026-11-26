@@ -15,6 +15,9 @@ haven-core.workspace = true
 haven-highlight.workspace = true
 haven-macos.workspace = true
 nucleo.workspace = true
+# Decoding thumbnails ourselves (same versions gpui already uses).
+image = { version = "0.25", default-features = false, features = ["png"] }
+smallvec = "1"
 raw-window-handle = "0.6"
 smol.workspace = true
 unicode-segmentation = "1"

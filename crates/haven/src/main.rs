@@ -193,6 +193,7 @@ fn main() {
         text_field::bind_keys(cx);
         cx.set_menus(menus());
         cx.on_action(|_: &Quit, cx| {
+            workspace::wait_for_tag_writes();
             Store::flush(cx);
             cx.quit()
         });

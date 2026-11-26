@@ -54,6 +54,11 @@ pub struct Workspace {
     undo_stack: Vec<Undo>,
     /// An undo is running in the background; further ⌘Z wait for it.
     undo_running: bool,
+    /// A background "do the tabs' folders still exist?" check is running;
+    /// at most one at a time (a hung network mount must not pile up blocked
+    /// stats). `exists_again` asks for one more run afterwards.
+    exists_checking: bool,
+    exists_again: bool,
     /// Tag writes are read-modify-write on each file's xattr: they go through
     /// one background worker, in order, so quick successive changes can't race.
     tag_tx: smol::channel::Sender<(Vec<PathBuf>, Tag, bool)>,
@@ -112,6 +117,7 @@ impl Workspace {
             .spawn(async move {
                 while let Ok((paths, tag, on)) = tag_rx.recv().await {
                     let r = haven_core::tags::set_tag(&paths, &tag, on).map_err(|e| e.to_string());
+                    PENDING_TAG_WRITES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     // Keep draining even if nobody listens any more (window
                     // closed): queued tag writes must still land on disk.
                     let _ = tag_done_tx.send(r).await;
@@ -152,6 +158,8 @@ impl Workspace {
             next_job: 0,
             undo_stack: Vec::new(),
             undo_running: false,
+            exists_checking: false,
+            exists_again: false,
             tag_tx,
             toast: None,
             sidebar_visible: true,
@@ -386,12 +394,20 @@ impl Workspace {
                 cx.notify();
             });
         }
-        // Deleting a folder is reported for its *parent* only: a tab showing
-        // the folder (or anything inside it) moves up to the nearest folder
-        // that still exists, like Finder. Every tab is checked (the reported
-        // parent may be a canonical path that doesn't prefix-match the tab's),
-        // and the stats run off the UI thread: a tab on a stalled network
-        // share must not freeze the window.
+        self.check_tab_dirs_exist(cx);
+    }
+
+    /// Deleting a folder is reported for its *parent* only: a tab showing the
+    /// folder (or anything inside it) moves up to the nearest folder that
+    /// still exists, like Finder. Every tab is checked (the reported parent
+    /// may be a canonical path that doesn't prefix-match the tab's), off the
+    /// UI thread, and one check at a time.
+    fn check_tab_dirs_exist(&mut self, cx: &mut Context<Self>) {
+        if self.exists_checking {
+            self.exists_again = true;
+            return;
+        }
+        self.exists_checking = true;
         let shown: Vec<PathBuf> = self
             .tabs
             .iter()
@@ -414,10 +430,11 @@ impl Workspace {
         });
         cx.spawn(async move |this, cx| {
             let gone = check.await;
-            if gone.is_empty() {
-                return;
-            }
             let _ = this.update(cx, |ws, cx| {
+                ws.exists_checking = false;
+                if std::mem::take(&mut ws.exists_again) {
+                    ws.check_tab_dirs_exist(cx);
+                }
                 for tab in &ws.tabs {
                     tab.update(cx, |t, cx| {
                         let Some(dir) = t.dir().map(Path::to_path_buf) else {
@@ -1161,7 +1178,9 @@ impl Workspace {
             s.learn_tag(&tag);
         });
         // Off the UI thread, in order (see `tag_tx`).
-        let _ = self.tag_tx.try_send((paths, tag, on));
+        if self.tag_tx.try_send((paths, tag, on)).is_ok() {
+            PENDING_TAG_WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     pub fn toggle_tag_on_selection(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -1287,6 +1306,19 @@ fn same_volume(paths: &[PathBuf], dest: &Path) -> bool {
 }
 
 /// Reloads drives and recents in the background.
+/// Tag writes queued or in flight (see `Workspace::tag_tx`).
+static PENDING_TAG_WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Called on Quit: give queued tag writes up to 2 s to reach the disk.
+pub fn wait_for_tag_writes() {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while PENDING_TAG_WRITES.load(std::sync::atomic::Ordering::SeqCst) > 0
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 pub fn refresh_start_data(cx: &mut App) {
     let fresh = cx
         .global::<StartData>()

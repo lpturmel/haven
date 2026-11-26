@@ -1104,6 +1104,7 @@ impl Render for Workspace {
             .font_family(UI_FONT)
             .text_color(t.text)
             .on_action(cx.listener(|_, _: &Quit, _, cx| {
+                crate::workspace::wait_for_tag_writes();
                 Store::flush(cx);
                 cx.quit()
             }))

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
-use gpui::{App, Global, Image, ImageFormat};
+use gpui::{App, Global, Image, ImageFormat, ImageSource, RenderImage};
 use haven_core::Entry;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -29,15 +29,42 @@ impl IconSize {
 
 #[derive(Default)]
 pub struct IconCache {
-    map: HashMap<(String, IconSize), Option<Arc<Image>>>,
+    map: HashMap<(String, IconSize), Option<ImageSource>>,
     pending: HashSet<(String, IconSize)>,
-    /// Per-file thumbnails in insertion order, evicted beyond `MAX_THUMBS`
-    /// (type icons are few and stay cached).
-    thumbs: VecDeque<(String, IconSize)>,
+    /// Per-file thumbnails in insertion order with their decoded size,
+    /// evicted beyond `THUMB_BUDGET` bytes (type icons are few and stay).
+    thumbs: VecDeque<((String, IconSize), usize)>,
+    thumb_bytes: usize,
 }
 
-/// Per-file image thumbnails kept in memory.
-const MAX_THUMBS: usize = 400;
+/// Decoded per-file thumbnails kept in memory (CPU + GPU atlas).
+const THUMB_BUDGET: usize = 192 * 1024 * 1024;
+
+/// What the background job produced.
+enum Loaded {
+    /// A shared type/path icon: gpui decodes and caches it by content.
+    Encoded(Arc<Image>),
+    /// A per-file thumbnail decoded here, so its atlas tile can be freed
+    /// with `drop_image` on eviction (gpui's own asset cache can't: a
+    /// re-decode gets a new id and orphans the old tile).
+    Decoded(Arc<RenderImage>, usize),
+}
+
+/// PNG -> gpui's BGRA frame.
+fn decode_png(png: &[u8]) -> Option<(Arc<RenderImage>, usize)> {
+    let mut rgba = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .ok()?
+        .into_rgba8();
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    let bytes = rgba.len();
+    let frame = image::Frame::new(rgba);
+    Some((
+        Arc::new(RenderImage::new(smallvec::smallvec![frame])),
+        bytes,
+    ))
+}
 
 impl Global for IconCache {}
 
@@ -84,7 +111,7 @@ impl IconCache {
     }
 }
 
-pub fn entry_icon(entry: &Entry, size: IconSize, cx: &mut App) -> Option<Arc<Image>> {
+pub fn entry_icon(entry: &Entry, size: IconSize, cx: &mut App) -> Option<ImageSource> {
     // Thumbnails are keyed by size + mtime too, so a file changed in place
     // (or read mid-copy) gets a fresh one.
     let mtime = entry
@@ -110,7 +137,7 @@ pub fn path_icon(
     ext: &str,
     size: IconSize,
     cx: &mut App,
-) -> Option<Arc<Image>> {
+) -> Option<ImageSource> {
     icon(path, is_dir, is_package, ext, size, "", cx)
 }
 
@@ -122,7 +149,7 @@ fn icon(
     size: IconSize,
     stamp: &str,
     cx: &mut App,
-) -> Option<Arc<Image>> {
+) -> Option<ImageSource> {
     let source = source_for(path, is_dir, is_package, ext);
     let key = match &source {
         Source::Type(t) => (format!("t:{t}"), size),
@@ -139,39 +166,67 @@ fn icon(
     cx.global_mut::<IconCache>().pending.insert(key.clone());
     let px = size.px();
     let task = cx.background_executor().spawn(async move {
-        let png = match source {
-            Source::Type(t) => haven_macos::type_icon_png(&t, px),
-            Source::Path(p) => haven_macos::file_icon_png(Path::new(&p), px),
+        match source {
+            Source::Type(t) => haven_macos::type_icon_png(&t, px)
+                .map(|b| Loaded::Encoded(Arc::new(Image::from_bytes(ImageFormat::Png, b)))),
+            Source::Path(p) => haven_macos::file_icon_png(Path::new(&p), px)
+                .map(|b| Loaded::Encoded(Arc::new(Image::from_bytes(ImageFormat::Png, b)))),
             Source::Thumb(p) => haven_macos::image_thumbnail_png(Path::new(&p), px as u32)
-                .or_else(|| haven_macos::file_icon_png(Path::new(&p), px)),
-        };
-        png.map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
+                .or_else(|| haven_macos::file_icon_png(Path::new(&p), px))
+                .and_then(|png| decode_png(&png))
+                .map(|(img, bytes)| Loaded::Decoded(img, bytes)),
+        }
     });
     cx.spawn(async move |cx| {
-        let image = task.await;
+        let loaded = task.await;
         let _ = cx.update(|cx| {
-            let mut evicted_images = Vec::new();
+            let mut evicted: Vec<Arc<RenderImage>> = Vec::new();
             let cache = cx.global_mut::<IconCache>();
             cache.pending.remove(&key);
-            if key.0.starts_with("i:") {
-                cache.thumbs.push_back(key.clone());
-                while cache.thumbs.len() > MAX_THUMBS {
-                    if let Some(old) = cache.thumbs.pop_front()
-                        && let Some(Some(evicted)) = cache.map.remove(&old)
-                    {
-                        evicted_images.push(evicted);
+            let source = match loaded {
+                None => None,
+                Some(Loaded::Encoded(img)) => Some(ImageSource::Image(img)),
+                Some(Loaded::Decoded(img, bytes)) => {
+                    cache.thumbs.push_back((key.clone(), bytes));
+                    cache.thumb_bytes += bytes;
+                    while cache.thumb_bytes > THUMB_BUDGET && cache.thumbs.len() > 1 {
+                        let Some((old, old_bytes)) = cache.thumbs.pop_front() else {
+                            break;
+                        };
+                        cache.thumb_bytes -= old_bytes;
+                        if let Some(Some(ImageSource::Render(r))) = cache.map.remove(&old) {
+                            evicted.push(r);
+                        }
                     }
+                    Some(ImageSource::Render(img))
                 }
-            }
-            cache.map.insert(key, image);
-            // gpui keeps the *decoded* bitmap per image in its asset cache;
-            // dropping our handle alone doesn't free it.
-            for img in evicted_images {
-                img.remove_asset(cx);
+            };
+            cache.map.insert(key, source);
+            // Free the evicted thumbnails' GPU atlas tiles in every window.
+            for r in evicted {
+                cx.drop_image(r, None);
             }
             cx.refresh_windows();
         });
     })
     .detach();
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_thumbnails_are_bgra() {
+        let mut png = Vec::new();
+        let red = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
+        red.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let (img, bytes) = decode_png(&png).expect("decodes");
+        assert_eq!(bytes, 2 * 4);
+        let frame = img.as_bytes(0).unwrap();
+        assert_eq!(&frame[..4], &[0, 0, 255, 255]); // B, G, R, A
+        assert!(decode_png(b"not a png").is_none());
+    }
 }
