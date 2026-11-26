@@ -15,6 +15,8 @@ The design plan lives in `docs/PLAN.md`.
 - Every list is virtualized with `uniform_list`.
 - Keep `haven-core` free of gpui so it stays unit-testable.
 - Run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` before every commit.
+- Performance budgets live in `crates/*/tests/perf.rs`, which are `#[ignore]`d. Run them with `cargo test --release -p <crate> --test perf -- --ignored`.
+- To take screenshots, bundle the app first (`PROFILE=debug scripts/bundle-macos.sh`, then `open target/bundle/Haven.app`). The bundle id is `dev.haven.app`. The bare binary does not appear in the app list that screenshot tools use.
 
 ## Workflow: PRs and 3-tier validation
 1. Work on a feature branch and open a PR against `main`.
