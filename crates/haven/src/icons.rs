@@ -39,6 +39,8 @@ pub struct IconCache {
 
 /// Decoded per-file thumbnails kept in memory (CPU + GPU atlas).
 const THUMB_BUDGET: usize = 192 * 1024 * 1024;
+/// Budget charged for a cached "no thumbnail" entry.
+const FAILED_ENTRY_COST: usize = 4096;
 
 /// What the background job produced.
 enum Loaded {
@@ -183,7 +185,15 @@ fn icon(
             let mut evicted: Vec<Arc<RenderImage>> = Vec::new();
             let cache = cx.global_mut::<IconCache>();
             cache.pending.remove(&key);
+            let thumb = key.0.starts_with("i:");
             let source = match loaded {
+                // A failed thumbnail is cached too (no retry every frame) but
+                // still counts against the budget, so such entries are evicted.
+                None if thumb => {
+                    cache.thumbs.push_back((key.clone(), FAILED_ENTRY_COST));
+                    cache.thumb_bytes += FAILED_ENTRY_COST;
+                    None
+                }
                 None => None,
                 Some(Loaded::Encoded(img)) => Some(ImageSource::Image(img)),
                 Some(Loaded::Decoded(img, bytes)) => {

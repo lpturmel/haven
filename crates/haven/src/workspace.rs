@@ -1,5 +1,6 @@
 //! Root view: sidebar + main card (tabs, toolbar, content, status bar) + overlays.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,11 +55,8 @@ pub struct Workspace {
     undo_stack: Vec<Undo>,
     /// An undo is running in the background; further ⌘Z wait for it.
     undo_running: bool,
-    /// A background "do the tabs' folders still exist?" check is running;
-    /// at most one at a time (a hung network mount must not pile up blocked
-    /// stats). `exists_again` asks for one more run afterwards.
-    exists_checking: bool,
-    exists_again: bool,
+    /// Tab folders with a background "does it still exist?" check running.
+    exists_inflight: HashSet<PathBuf>,
     /// Tag writes are read-modify-write on each file's xattr: they go through
     /// one background worker, in order, so quick successive changes can't race.
     tag_tx: smol::channel::Sender<(Vec<PathBuf>, Tag, bool)>,
@@ -158,8 +156,7 @@ impl Workspace {
             next_job: 0,
             undo_stack: Vec::new(),
             undo_running: false,
-            exists_checking: false,
-            exists_again: false,
+            exists_inflight: HashSet::new(),
             tag_tx,
             toast: None,
             sidebar_visible: true,
@@ -403,51 +400,49 @@ impl Workspace {
     /// may be a canonical path that doesn't prefix-match the tab's), off the
     /// UI thread, and one check at a time.
     fn check_tab_dirs_exist(&mut self, cx: &mut Context<Self>) {
-        if self.exists_checking {
-            self.exists_again = true;
-            return;
-        }
-        self.exists_checking = true;
         let shown: Vec<PathBuf> = self
             .tabs
             .iter()
             .filter_map(|t| t.read(cx).dir().map(Path::to_path_buf))
             .collect();
-        let check = cx.background_executor().spawn(async move {
-            shown
-                .into_iter()
-                .filter(|dir| !dir.is_dir())
-                .filter_map(|dir| {
+        for dir in shown {
+            // One check per folder at a time: a folder on a hung mount blocks
+            // only its own check (and doesn't pile up blocked threads), while
+            // other tabs keep being checked.
+            if !self.exists_inflight.insert(dir.clone()) {
+                continue;
+            }
+            let check = cx.background_executor().spawn({
+                let dir = dir.clone();
+                async move {
+                    if dir.is_dir() {
+                        return None;
+                    }
                     let mut up = dir.parent();
                     while let Some(p) = up
                         && !p.is_dir()
                     {
                         up = p.parent();
                     }
-                    up.map(|p| (dir.clone(), p.to_path_buf()))
-                })
-                .collect::<Vec<_>>()
-        });
-        cx.spawn(async move |this, cx| {
-            let gone = check.await;
-            let _ = this.update(cx, |ws, cx| {
-                ws.exists_checking = false;
-                if std::mem::take(&mut ws.exists_again) {
-                    ws.check_tab_dirs_exist(cx);
-                }
-                for tab in &ws.tabs {
-                    tab.update(cx, |t, cx| {
-                        let Some(dir) = t.dir().map(Path::to_path_buf) else {
-                            return;
-                        };
-                        if let Some((_, up)) = gone.iter().find(|(old, _)| *old == dir) {
-                            t.navigate(Location::Dir(up.clone()), true, cx);
-                        }
-                    });
+                    up.map(Path::to_path_buf)
                 }
             });
-        })
-        .detach();
+            cx.spawn(async move |this, cx| {
+                let up = check.await;
+                let _ = this.update(cx, |ws, cx| {
+                    ws.exists_inflight.remove(&dir);
+                    let Some(up) = up else { return };
+                    for tab in &ws.tabs {
+                        tab.update(cx, |t, cx| {
+                            if t.dir() == Some(dir.as_path()) {
+                                t.navigate(Location::Dir(up.clone()), true, cx);
+                            }
+                        });
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     // ---------------------------------------------------------------- navigation
@@ -1178,8 +1173,11 @@ impl Workspace {
             s.learn_tag(&tag);
         });
         // Off the UI thread, in order (see `tag_tx`).
-        if self.tag_tx.try_send((paths, tag, on)).is_ok() {
-            PENDING_TAG_WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Count before sending: the worker may finish (and decrement)
+        // before `try_send` even returns.
+        PENDING_TAG_WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.tag_tx.try_send((paths, tag, on)).is_err() {
+            PENDING_TAG_WRITES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
