@@ -1070,17 +1070,14 @@ impl Tab {
                 // frame, and the pane doesn't scroll horizontally anyway).
                 let mut lines_vec = Vec::new();
                 for line in text.split('\n').take(MAX_PREVIEW_LINES) {
-                    if line.len() > MAX_LINE_BYTES {
-                        let mut end = MAX_LINE_BYTES;
-                        while !line.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        lines_vec.push(SharedString::from(format!("{}…", &line[..end])));
-                    } else {
-                        lines_vec.push(SharedString::from(line.to_string()));
-                    }
+                    lines_vec.push(cap_line(line));
                 }
-                let truncated = truncated || text.split('\n').nth(MAX_PREVIEW_LINES).is_some();
+                // (A trailing newline after exactly MAX lines is not "more".)
+                let truncated = truncated
+                    || text
+                        .split('\n')
+                        .skip(MAX_PREVIEW_LINES)
+                        .any(|l| !l.is_empty());
                 let lines: Arc<Vec<SharedString>> = Arc::new(lines_vec);
                 let _ = this.update(cx, |tab, cx| {
                     tab.preview_scroll = UniformListScrollHandle::new();
@@ -1123,6 +1120,24 @@ impl Tab {
             }),
         });
     }
+}
+
+/// A preview line, cut at MAX_LINE_BYTES (on a char boundary) with `…`.
+fn cap_line(line: &str) -> SharedString {
+    if line.len() > MAX_LINE_BYTES {
+        let end = floor_char_boundary(line, MAX_LINE_BYTES);
+        SharedString::from(format!("{}…", &line[..end]))
+    } else {
+        SharedString::from(line.to_string())
+    }
+}
+
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 const MAX_PREVIEW_LINES: usize = 50_000;
@@ -1203,8 +1218,11 @@ fn build_runs(
             let mut pos = 0;
             if let Some(line_spans) = spans.get(i) {
                 for (range, style) in line_spans {
-                    let start = range.start.min(line.len());
-                    let end = range.end.min(line.len());
+                    // Spans come from the full text; a long line was cut and
+                    // got a `…`, so snap to char boundaries of what's shown
+                    // (gpui panics on a run that splits a character).
+                    let start = floor_char_boundary(line, range.start);
+                    let end = floor_char_boundary(line, range.end);
                     if start < pos || end <= start {
                         continue;
                     }
@@ -1501,5 +1519,53 @@ mod tests {
         cx.run_until_parked();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         tab.read_with(cx, |t, _| assert!(t.column_errors.contains_key(&locked)));
+    }
+
+    #[test]
+    fn runs_on_cut_minified_lines_stay_on_char_boundaries() {
+        // One long JSON line, shifted so tokens straddle the cut and the `…`.
+        for shift in 0..12 {
+            let mut src = String::from("[");
+            src.push_str(&"x".repeat(shift));
+            src.push_str("1,");
+            while src.len() < MAX_LINE_BYTES + 200 {
+                src.push_str(r#"{"key":"valué","n":12345,"t":true},"#);
+            }
+            src.push_str("null]");
+            let text = haven_highlight::normalize(&src);
+            let spans = haven_highlight::highlight(haven_highlight::Lang::Json, &text, None)
+                .expect("json highlights");
+            let lines: Vec<SharedString> = text.split('\n').map(cap_line).collect();
+            let runs = build_runs(&lines, &spans, &font(MONO_FONT), gpui::black(), |_| {
+                gpui::white()
+            });
+            for (line, line_runs) in lines.iter().zip(&runs) {
+                let mut pos = 0;
+                for r in line_runs {
+                    pos += r.len;
+                    assert!(
+                        line.is_char_boundary(pos),
+                        "run splits a char (shift {shift})"
+                    );
+                }
+                assert_eq!(pos, line.len());
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn exactly_max_lines_with_trailing_newline_is_not_truncated(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        std::fs::write(dir.join("exact.txt"), "l\n".repeat(MAX_PREVIEW_LINES)).unwrap();
+        let tab = cx.new(|cx| Tab::new(Location::Dir(dir.clone()), cx));
+        cx.run_until_parked();
+        tab.update(cx, |t, cx| t.select_only(0, cx));
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        tab.read_with(cx, |t, _| match &t.preview {
+            Preview::Text(tp) => assert!(!tp.truncated),
+            _ => panic!("expected text preview"),
+        });
     }
 }

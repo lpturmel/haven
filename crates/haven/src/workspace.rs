@@ -112,9 +112,9 @@ impl Workspace {
             .spawn(async move {
                 while let Ok((paths, tag, on)) = tag_rx.recv().await {
                     let r = haven_core::tags::set_tag(&paths, &tag, on).map_err(|e| e.to_string());
-                    if tag_done_tx.send(r).await.is_err() {
-                        break;
-                    }
+                    // Keep draining even if nobody listens any more (window
+                    // closed): queued tag writes must still land on disk.
+                    let _ = tag_done_tx.send(r).await;
                 }
             })
             .detach();
@@ -375,26 +375,6 @@ impl Workspace {
     fn reload_dirs(&mut self, dirs: &[PathBuf], cx: &mut Context<Self>) {
         for tab in &self.tabs {
             tab.update(cx, |t, cx| {
-                // Deleting a folder is reported for its *parent* only: a tab
-                // showing the folder (or anything inside it) moves up to the
-                // nearest folder that still exists, like Finder.
-                // (Checked on every event: the reported parent may be a
-                // canonical path that doesn't prefix-match the tab's own.)
-                if let Some(dir) = t.dir().map(Path::to_path_buf)
-                    && !dir.is_dir()
-                {
-                    let mut up = dir.parent();
-                    while let Some(p) = up
-                        && !p.is_dir()
-                    {
-                        up = p.parent();
-                    }
-                    if let Some(p) = up {
-                        t.navigate(Location::Dir(p.to_path_buf()), true, cx);
-                    }
-                    cx.notify();
-                    return;
-                }
                 let hit = t.dir().is_some_and(|d| dirs.iter().any(|x| x == d));
                 // Columns view also caches ancestor/peek listings, including
                 // subfolders that may just have been removed or renamed.
@@ -406,6 +386,51 @@ impl Workspace {
                 cx.notify();
             });
         }
+        // Deleting a folder is reported for its *parent* only: a tab showing
+        // the folder (or anything inside it) moves up to the nearest folder
+        // that still exists, like Finder. Every tab is checked (the reported
+        // parent may be a canonical path that doesn't prefix-match the tab's),
+        // and the stats run off the UI thread: a tab on a stalled network
+        // share must not freeze the window.
+        let shown: Vec<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.read(cx).dir().map(Path::to_path_buf))
+            .collect();
+        let check = cx.background_executor().spawn(async move {
+            shown
+                .into_iter()
+                .filter(|dir| !dir.is_dir())
+                .filter_map(|dir| {
+                    let mut up = dir.parent();
+                    while let Some(p) = up
+                        && !p.is_dir()
+                    {
+                        up = p.parent();
+                    }
+                    up.map(|p| (dir.clone(), p.to_path_buf()))
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let gone = check.await;
+            if gone.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |ws, cx| {
+                for tab in &ws.tabs {
+                    tab.update(cx, |t, cx| {
+                        let Some(dir) = t.dir().map(Path::to_path_buf) else {
+                            return;
+                        };
+                        if let Some((_, up)) = gone.iter().find(|(old, _)| *old == dir) {
+                            t.navigate(Location::Dir(up.clone()), true, cx);
+                        }
+                    });
+                }
+            });
+        })
+        .detach();
     }
 
     // ---------------------------------------------------------------- navigation

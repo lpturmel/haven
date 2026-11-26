@@ -150,17 +150,25 @@ fn icon(
     cx.spawn(async move |cx| {
         let image = task.await;
         let _ = cx.update(|cx| {
+            let mut evicted_images = Vec::new();
             let cache = cx.global_mut::<IconCache>();
             cache.pending.remove(&key);
             if key.0.starts_with("i:") {
                 cache.thumbs.push_back(key.clone());
                 while cache.thumbs.len() > MAX_THUMBS {
-                    if let Some(old) = cache.thumbs.pop_front() {
-                        cache.map.remove(&old);
+                    if let Some(old) = cache.thumbs.pop_front()
+                        && let Some(Some(evicted)) = cache.map.remove(&old)
+                    {
+                        evicted_images.push(evicted);
                     }
                 }
             }
             cache.map.insert(key, image);
+            // gpui keeps the *decoded* bitmap per image in its asset cache;
+            // dropping our handle alone doesn't free it.
+            for img in evicted_images {
+                img.remove_asset(cx);
+            }
             cx.refresh_windows();
         });
     })
