@@ -10,8 +10,14 @@
 #
 #   start.png    start page (pinned / drives / recents)
 #   list.png     list view   — columns must line up under their headers
-#   grid.png     grid view
+#   grid.png     grid view (includes a HEIC photo thumbnail)
 #   columns.png  Miller columns
+#
+# Each scenario also gets <name>.window.png, the window alone (never covered
+# by other apps, but without the desktop behind the blur). If another app's
+# window covers Haven when capturing, the composited capture is retried and
+# finally skipped (and the legibility check with it) rather than recording
+# someone else's screen.
 #
 # Automatic check: the sidebar's background luminance must stay low enough for
 # its white text to be legible over any wallpaper (see SIDEBAR_MAX_LUMA).
@@ -48,6 +54,9 @@ head -c 50000 /dev/urandom >"${FIXTURE}/big.bin"
 echo small >"${FIXTURE}/a.txt"
 echo x >"${FIXTURE}/a-file-with-a-rather-long-name-to-test-truncation.txt"
 touch -t 202001010000 "${FIXTURE}/a.txt"
+# A HEIC photo (macOS ships some as wallpapers) exercises native thumbnails.
+HEIC="$(find "/System/Library/Desktop Pictures" -maxdepth 1 -name '*.heic' 2>/dev/null | head -1)"
+[[ -n "${HEIC}" ]] && cp "${HEIC}" "${FIXTURE}/photo.heic"
 
 STATE="$(mktemp -d /tmp/haven-visual-state.XXXXXX)"
 trap 'osascript -e "quit app id \"dev.haven.app\"" >/dev/null 2>&1 || true' EXIT
@@ -66,9 +75,20 @@ capture() {
     done
     [[ -n "${pid}" ]] || { echo "error: Haven did not start" >&2; exit 1; }
     sleep 2.5 # first paint, icons, blur
-    local bounds
-    bounds="$(swift "${HELPER}" bounds "${pid}")"
-    screencapture -x -o -R "${bounds}" "${OUT_DIR}/${name}.png"
+    local info wid bounds
+    info="$(swift "${HELPER}" bounds "${pid}")"
+    wid="${info%% *}"
+    bounds="${info#* }"
+    screencapture -x -o -l "${wid}" "${OUT_DIR}/${name}.window.png"
+    rm -f "${OUT_DIR}/${name}.png"
+    for _ in 1 2 3; do
+        if ! swift "${HELPER}" occluded "${wid}"; then
+            screencapture -x -o -R "${bounds}" "${OUT_DIR}/${name}.png"
+            break
+        fi
+        open -a "${APP}" # bring it back to the front and try again
+        sleep 1
+    done
     osascript -e 'quit app id "dev.haven.app"' >/dev/null 2>&1 || true
     for _ in $(seq 1 50); do
         kill -0 "${pid}" 2>/dev/null || break
@@ -83,6 +103,11 @@ for scenario in "start List" "list List ${FIXTURE}" "grid Grid ${FIXTURE}" "colu
     set -- ${scenario}
     name="$1"
     bounds="$(capture "$@")"
+    if [[ ! -f "${OUT_DIR}/${name}.png" ]]; then
+        printf '%-8s %s  SKIPPED composite (another window covered Haven); layout only\n' \
+            "${name}" "${OUT_DIR}/${name}.window.png"
+        continue
+    fi
     w="$(cut -d, -f3 <<<"${bounds}")"
     h="$(cut -d, -f4 <<<"${bounds}")"
     # Sample the sidebar's left padding (no text) below the traffic lights.

@@ -27,7 +27,7 @@ The design plan lives in `docs/PLAN.md`.
    1. **Unit tests:** `cargo test --workspace`. The PR must add or extend tests for the logic it changes, mostly in `haven-core`.
    2. **Integration tests:** GPUI view tests using gpui `test-support` / `TestAppContext` for the view state it touches (navigation, selection, path bar, and so on), plus `cargo build --release`.
    3. **Visual validation:**
-      - Run `scripts/visual-check.sh`. It must exit 0. It captures `target/visual/{start,list,grid,columns}.png` over the real desktop and fails if the sidebar is too bright for its text. Look at every capture.
+      - Run `scripts/visual-check.sh`. It must exit 0. It captures `target/visual/{start,list,grid,columns}.png` composited over the real desktop, plus a `.window.png` of the window alone. It fails if the sidebar is too bright for its text. If another app covers Haven during a capture, the composite is skipped rather than recording someone else's screen. Look at every capture, and never publish one that shows other apps.
       - Then drive the app by hand (keyboard input needs Haven to be the key window, so a screen-control agent needs full-screen control) through the feature and this regression checklist:
         - The sidebar is frosted: windows behind it are blurred, never readable. Its text is legible over a bright wallpaper. The content card is opaque and rounded, and the traffic lights don't overlap content.
         - List view: Date, Size and Kind sit under their headers on every row, and rows span the full width (Columns view too).
