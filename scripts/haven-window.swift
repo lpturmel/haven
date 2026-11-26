@@ -51,10 +51,23 @@ func occluded(windowID: Int) -> Bool {
         let above = CGWindowListCopyWindowInfo(
             [.optionOnScreenAboveWindow], CGWindowID(windowID)) as? [[String: Any]]
     else { return false }
+    // Any visible window above Haven counts (app windows, permission
+    // prompts, notifications, alerts), except system furniture that sits
+    // above everything without covering app content.
+    let furniture: Set<String> = [
+        "Window Server", "Dock", "SystemUIServer", "Control Center", "WindowManager",
+        "TextInputMenuAgent",
+    ]
     return above.contains { w in
         guard (w[kCGWindowOwnerPID as String] as? Int32) != myPid,
-            (w[kCGWindowLayer as String] as? Int) == 0,
+            !furniture.contains(w[kCGWindowOwnerName as String] as? String ?? ""),
+            // 24/25: the menu bar and its status items (owned by many apps).
+            ![24, 25].contains(w[kCGWindowLayer as String] as? Int ?? 0),
+            (w[kCGWindowLayer as String] as? Int ?? 0) < 1000,
             (w[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+            // Notification Center's full-screen container (banners are
+            // separate windows and still count).
+            (w[kCGWindowName as String] as? String) != "Notification Center",
             let d = w[kCGWindowBounds as String] as? NSDictionary,
             let r = CGRect(dictionaryRepresentation: d)
         else { return false }

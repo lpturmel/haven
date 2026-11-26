@@ -12,6 +12,7 @@ use super::{drag_payload, drag_preview, entry_icon_el};
 use crate::store::Store;
 use crate::tab::{DraggedFiles, Location, Tab};
 use crate::theme::theme;
+use crate::ui::Ellipsis as _;
 use crate::ui::{empty_state, icon, tag_dot};
 
 pub const ROW_H: f32 = 26.;
@@ -249,7 +250,7 @@ fn row(tab: &mut Tab, ix: usize, cx: &mut Context<Tab>) -> AnyElement {
                 .child(
                     div()
                         .min_w_0()
-                        .truncate()
+                        .ellipsis()
                         .text_color(t.text)
                         .child(entry.name.clone()),
                 )
@@ -270,7 +271,7 @@ fn row(tab: &mut Tab, ix: usize, cx: &mut Context<Tab>) -> AnyElement {
                 .w(px(DATE_W))
                 .flex_none()
                 .px(px(6.))
-                .truncate()
+                .ellipsis()
                 .text_color(t.text_muted)
                 .child(fmt::date(entry.modified)),
         )
@@ -289,7 +290,7 @@ fn row(tab: &mut Tab, ix: usize, cx: &mut Context<Tab>) -> AnyElement {
                 .w(px(KIND_W))
                 .flex_none()
                 .px(px(6.))
-                .truncate()
+                .ellipsis()
                 .text_color(t.text_muted)
                 .child(kind_label(&entry)),
         )

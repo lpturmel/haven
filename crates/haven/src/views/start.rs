@@ -17,6 +17,7 @@ use crate::actions::NavigateTo;
 use crate::store::Store;
 use crate::tab::{DraggedFiles, Location, Tab};
 use crate::theme::theme;
+use crate::ui::Ellipsis as _;
 use crate::ui::{icon, icon_button, tag_dot};
 
 /// Drives and recents, refreshed by the workspace.
@@ -27,6 +28,8 @@ pub struct StartData {
     /// Metadata for the recents shown (stat'ed in the background, not per render).
     pub recent_entries: Vec<Option<Entry>>,
     pub recents_loaded: Option<Instant>,
+    /// Sidebar places that exist (checked in the background).
+    pub places: Option<Vec<(String, PathBuf, &'static str)>>,
     pub pinned: Vec<Entry>,
 }
 
@@ -105,7 +108,7 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                         }))
                         .child(
                             div()
-                                .truncate()
+                                .ellipsis()
                                 .text_size(px(12.))
                                 .text_color(t.text)
                                 .child(e.name.clone()),
@@ -168,7 +171,7 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                             .gap(px(4.))
                             .child(
                                 div()
-                                    .truncate()
+                                    .ellipsis()
                                     .text_size(px(13.))
                                     .text_color(t.text)
                                     .child(v.name.clone()),
@@ -236,7 +239,7 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
+                        .ellipsis()
                         .text_size(px(13.))
                         .text_color(t.text)
                         .child(

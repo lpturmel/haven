@@ -19,6 +19,7 @@ use crate::actions::*;
 use crate::store::Store;
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::theme::theme;
+use crate::ui::Ellipsis as _;
 use crate::ui::{icon, kbd, tag_dot, text_button};
 use crate::views::start::start_data;
 use crate::workspace::Workspace;
@@ -369,7 +370,7 @@ pub fn render_context_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> Optio
                                 }),
                             ),
                         )
-                        .child(div().flex_1().truncate().child(label.clone()))
+                        .child(div().flex_1().ellipsis().child(label.clone()))
                         .children(
                             shortcut.clone().map(|s| {
                                 div().text_size(px(11.)).text_color(t.text_faint).child(s)
@@ -1143,7 +1144,7 @@ pub fn render_overlay(
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .truncate()
+                                .ellipsis()
                                 .text_size(px(12.))
                                 .text_color(t.text_faint)
                                 .child(d)
@@ -1386,7 +1387,7 @@ pub fn render_overlay(
                                         div()
                                             .flex_1()
                                             .min_w_0()
-                                            .truncate()
+                                            .ellipsis()
                                             .text_color(t.text_muted)
                                             .child(old.clone()),
                                     )
@@ -1397,7 +1398,7 @@ pub fn render_overlay(
                                         div()
                                             .flex_1()
                                             .min_w_0()
-                                            .truncate()
+                                            .ellipsis()
                                             .text_color(if changed {
                                                 t.accent_text
                                             } else {

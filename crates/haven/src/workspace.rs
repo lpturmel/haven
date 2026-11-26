@@ -1325,6 +1325,7 @@ pub fn refresh_start_data(cx: &mut App) {
     let history = Store::get(cx).history_recents();
     let task = cx.background_executor().spawn(async move {
         let vols = volumes::list_volumes();
+        let places = crate::workspace_view::places();
         let rec = if fresh {
             None
         } else {
@@ -1335,13 +1336,14 @@ pub fn refresh_start_data(cx: &mut App) {
                 .collect();
             Some((merged, entries))
         };
-        (vols, rec)
+        (vols, rec, places)
     });
     cx.spawn(async move |cx| {
-        let (vols, rec) = task.await;
+        let (vols, rec, places) = task.await;
         let _ = cx.update(|cx| {
             let data = cx.global_mut::<StartData>();
             data.volumes = vols;
+            data.places = Some(places);
             if let Some((r, entries)) = rec {
                 data.recents = r;
                 data.recent_entries = entries;
@@ -1944,5 +1946,33 @@ mod tests {
         cx.run_until_parked();
         let tags = haven_core::tags::read_tags(&root.join("projects/readme.md"));
         assert_eq!(tags, vec![Tag::new("Red", haven_core::TagColor::Red)]);
+    }
+
+    #[gpui::test]
+    async fn drops_move_within_a_volume_and_copy_with_option(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        std::fs::create_dir(root.join("dst")).unwrap();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        std::fs::write(root.join("b.txt"), b"b").unwrap();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        ws.update_in(cx, |ws, window, cx| {
+            ws.drop_files(
+                vec![root.join("a.txt")],
+                root.join("dst"),
+                false,
+                window,
+                cx,
+            );
+            ws.drop_files(vec![root.join("b.txt")], root.join("dst"), true, window, cx);
+        });
+        cx.run_until_parked();
+        // Same volume, no ⌥: moved. With ⌥: copied (original kept).
+        assert!(!root.join("a.txt").exists() && root.join("dst/a.txt").exists());
+        assert!(root.join("b.txt").exists() && root.join("dst/b.txt").exists());
+        // Another volume (devfs here) is never "the same volume", so drops
+        // there copy instead of deleting the originals.
+        assert!(same_volume(&[root.join("b.txt")], &root.join("dst")));
+        assert!(!same_volume(&[root.join("b.txt")], Path::new("/dev")));
     }
 }

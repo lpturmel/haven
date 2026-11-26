@@ -17,6 +17,7 @@ use crate::overlays::{self, Overlay, render_context_menu, render_overlay, sort_m
 use crate::store::Store;
 use crate::tab::{DraggedFiles, Location};
 use crate::theme::{UI_FONT, theme};
+use crate::ui::Ellipsis as _;
 use crate::ui::{icon, icon_button, section_label, tag_dot};
 use crate::views::start::start_data;
 use crate::workspace::Workspace;
@@ -47,9 +48,22 @@ impl Render for DraggedPin {
     }
 }
 
-fn places() -> Vec<(String, PathBuf, &'static str)> {
+/// Sidebar places that exist. Stats the filesystem: called in the background
+/// (see `refresh_start_data`), never while rendering.
+pub fn places() -> Vec<(String, PathBuf, &'static str)> {
+    let mut v = all_places();
+    let icloud = home_dir().join("Library/Mobile Documents/com~apple~CloudDocs");
+    if icloud.exists() {
+        v.push(("iCloud Drive".into(), icloud, "cloud"));
+    }
+    v.retain(|(_, p, _)| p.exists());
+    v
+}
+
+/// The standard places, unchecked (shown until the background check lands).
+fn all_places() -> Vec<(String, PathBuf, &'static str)> {
     let home = home_dir();
-    let mut v = vec![
+    vec![
         ("Desktop".to_string(), home.join("Desktop"), "monitor"),
         ("Documents".to_string(), home.join("Documents"), "file-text"),
         ("Downloads".to_string(), home.join("Downloads"), "download"),
@@ -68,13 +82,7 @@ fn places() -> Vec<(String, PathBuf, &'static str)> {
             home.clone(),
             "house",
         ),
-    ];
-    let icloud = home.join("Library/Mobile Documents/com~apple~CloudDocs");
-    if icloud.exists() {
-        v.push(("iCloud Drive".into(), icloud, "cloud"));
-    }
-    v.retain(|(_, p, _)| p.exists());
-    v
+    ]
 }
 
 impl Workspace {
@@ -106,7 +114,7 @@ impl Workspace {
             } else {
                 t.sidebar_icon
             }))
-            .child(div().flex_1().min_w_0().truncate().child(label));
+            .child(div().flex_1().min_w_0().ellipsis().child(label));
         match path {
             Some(path) => {
                 let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
@@ -283,7 +291,10 @@ impl Workspace {
             pins
         };
 
-        let place_rows: Vec<AnyElement> = places()
+        let place_rows: Vec<AnyElement> = crate::views::start::start_data(cx)
+            .places
+            .clone()
+            .unwrap_or_else(all_places)
             .into_iter()
             .enumerate()
             .map(|(i, (label, path, ic))| {
@@ -512,7 +523,7 @@ impl Workspace {
                     } else {
                         t.text_faint
                     }))
-                    .child(div().flex_1().min_w_0().truncate().child(title))
+                    .child(div().flex_1().min_w_0().ellipsis().child(title))
                     .child(
                         div()
                             .id(("tab-close", i))
@@ -1012,7 +1023,7 @@ impl Workspace {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .truncate()
+                                    .ellipsis()
                                     .text_size(px(12.))
                                     .text_color(t.text)
                                     .child(job.label.clone()),
@@ -1043,7 +1054,7 @@ impl Workspace {
                     .when(!done && !current.is_empty(), |d| {
                         d.child(
                             div()
-                                .truncate()
+                                .ellipsis()
                                 .text_size(px(10.5))
                                 .text_color(t.text_faint)
                                 .child(current),

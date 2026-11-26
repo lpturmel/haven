@@ -13,6 +13,7 @@ use haven_core::Entry;
 use super::{drag_payload, drag_preview, entry_icon_el, preview};
 use crate::tab::{Location, Tab};
 use crate::theme::theme;
+use crate::ui::Ellipsis as _;
 use crate::ui::icon;
 
 const COL_W: f32 = 230.;
@@ -190,7 +191,7 @@ fn static_row(
             div()
                 .flex_1()
                 .min_w_0()
-                .truncate()
+                .ellipsis()
                 .text_color(t.text)
                 .child(e.name.clone()),
         )
@@ -238,7 +239,7 @@ fn current_row(tab: &mut Tab, ix: usize, cx: &mut Context<Tab>) -> AnyElement {
             div()
                 .flex_1()
                 .min_w_0()
-                .truncate()
+                .ellipsis()
                 .text_color(t.text)
                 .child(e.name.clone()),
         )
