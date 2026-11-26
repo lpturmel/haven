@@ -1,0 +1,23 @@
+[package]
+name = "haven-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ignore.workspace = true
+jwalk.workspace = true
+libc.workspace = true
+notify.workspace = true
+nucleo.workspace = true
+plist.workspace = true
+rayon.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xattr.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+haven-macos.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

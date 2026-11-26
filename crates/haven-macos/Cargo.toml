@@ -1,0 +1,11 @@
+[package]
+name = "haven-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSError", "NSFileManager", "NSDictionary", "NSData", "NSGeometry", "NSArray", "NSAutoreleasePool"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "NSApplication", "NSResponder", "NSAppearance", "NSRunningApplication", "NSView", "NSVisualEffectView", "NSGraphics", "objc2-core-graphics", "objc2-core-foundation"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGImage"] }

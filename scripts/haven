@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# CLI shim: `haven [path]` opens a folder (or reveals a file) in Haven.App.
+target="${1:-$PWD}"
+exec open -b dev.haven.app "$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
