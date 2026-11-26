@@ -52,6 +52,11 @@ pub struct Workspace {
     pub jobs: Vec<Job>,
     next_job: usize,
     undo_stack: Vec<Undo>,
+    /// An undo is running in the background; further ⌘Z wait for it.
+    undo_running: bool,
+    /// Tag writes are read-modify-write on each file's xattr: they go through
+    /// one background worker, in order, so quick successive changes can't race.
+    tag_tx: smol::channel::Sender<(Vec<PathBuf>, Tag, bool)>,
     pub toast: Option<Toast>,
     pub sidebar_visible: bool,
     watcher: Option<DirWatcher>,
@@ -101,6 +106,33 @@ impl Workspace {
         })
         .detach();
 
+        let (tag_tx, tag_rx) = smol::channel::unbounded::<(Vec<PathBuf>, Tag, bool)>();
+        let (tag_done_tx, tag_done_rx) = smol::channel::unbounded::<Result<(), String>>();
+        cx.background_executor()
+            .spawn(async move {
+                while let Ok((paths, tag, on)) = tag_rx.recv().await {
+                    let r = haven_core::tags::set_tag(&paths, &tag, on).map_err(|e| e.to_string());
+                    if tag_done_tx.send(r).await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        cx.spawn(async move |this, cx| {
+            while let Ok(result) = tag_done_rx.recv().await {
+                let alive = this.update(cx, |ws, cx| {
+                    if let Err(e) = result {
+                        ws.show_toast(format!("Couldn't tag: {e}"), true, cx);
+                    }
+                    ws.active_tab().clone().update(cx, |t, cx| t.reload(cx));
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         let mut ws = Workspace {
             tabs: Vec::new(),
             active: 0,
@@ -119,6 +151,8 @@ impl Workspace {
             jobs: Vec::new(),
             next_job: 0,
             undo_stack: Vec::new(),
+            undo_running: false,
+            tag_tx,
             toast: None,
             sidebar_visible: true,
             watcher,
@@ -851,22 +885,34 @@ impl Workspace {
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {
+        // One undo at a time: they move files through temporary names and
+        // must not interleave (a fast second ⌘Z would race the first).
+        if self.undo_running {
+            self.show_toast("Still undoing…", false, cx);
+            return;
+        }
         let Some(undo) = self.undo_stack.pop() else {
             self.show_toast("Nothing to undo", false, cx);
             return;
         };
         let label = undo.describe();
         let record = undo.clone();
+        self.undo_running = true;
         let task = cx.background_executor().spawn(async move { undo.apply() });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |ws, cx| {
+                ws.undo_running = false;
                 match result {
                     Ok(_) => ws.show_toast(label, false, cx),
                     Err(e) => {
-                        // A failed undo rolls itself back, so keep the record:
-                        // the user can fix the conflict and press ⌘Z again.
-                        ws.undo_stack.push(record);
+                        // A failed undo rolls itself back. Keep the record only
+                        // when the user can fix the cause (something is in the
+                        // way); otherwise (item gone, Trash emptied, volume
+                        // ejected) it would block every older undo forever.
+                        if e.kind() == std::io::ErrorKind::AlreadyExists {
+                            ws.undo_stack.push(record);
+                        }
                         ws.show_toast(format!("Undo failed: {e}"), true, cx)
                     }
                 }
@@ -1069,20 +1115,8 @@ impl Workspace {
         Store::update(cx, |s| {
             s.learn_tag(&tag);
         });
-        // xattr writes for many files: off the UI thread.
-        let task = cx
-            .background_executor()
-            .spawn(async move { haven_core::tags::set_tag(&paths, &tag, on) });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |ws, cx| {
-                if let Err(e) = result {
-                    ws.show_toast(format!("Couldn't tag: {e}"), true, cx);
-                }
-                ws.active_tab().clone().update(cx, |t, cx| t.reload(cx));
-            });
-        })
-        .detach();
+        // Off the UI thread, in order (see `tag_tx`).
+        let _ = self.tag_tx.try_send((paths, tag, on));
     }
 
     pub fn toggle_tag_on_selection(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -1703,5 +1737,72 @@ mod tests {
         });
         assert_eq!(name.as_deref(), Some("my file.txt"));
         assert_eq!(cx.update(|_, cx| Store::get(cx).preview_visible), before);
+        // ⌥⌘P right after typing still toggles (it isn't the Space key).
+        cx.simulate_keystrokes("m cmd-alt-p");
+        assert_eq!(cx.update(|_, cx| Store::get(cx).preview_visible), !before);
+        // A plain Space (no type-ahead in progress) toggles too.
+        // (type-ahead expires on the real clock, not the test executor's)
+        std::thread::sleep(std::time::Duration::from_millis(850));
+        cx.simulate_keystrokes("space");
+        assert_eq!(cx.update(|_, cx| Store::get(cx).preview_visible), before);
+    }
+
+    #[gpui::test]
+    async fn quick_successive_tag_changes_all_apply(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let f = root.join("projects/readme.md");
+        let (ws, cx) = open(cx, Location::Dir(root.join("projects")));
+        let tab = ws.read_with(cx, |ws, _| ws.active_tab().clone());
+        tab.update(cx, |t, cx| {
+            let ix = t
+                .entries
+                .iter()
+                .position(|e| e.name == "readme.md")
+                .unwrap();
+            t.select_only(ix, cx);
+        });
+        ws.update(cx, |ws, cx| {
+            ws.apply_tag(Tag::new("Red", haven_core::TagColor::Red), true, cx);
+            ws.apply_tag(Tag::new("Blue", haven_core::TagColor::Blue), true, cx);
+            ws.apply_tag(Tag::new("Red", haven_core::TagColor::Red), false, cx);
+            ws.apply_tag(Tag::new("Green", haven_core::TagColor::Green), true, cx);
+        });
+        cx.run_until_parked();
+        let names: Vec<String> = haven_core::tags::read_tags(&f)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, ["Blue", "Green"]);
+    }
+
+    #[gpui::test]
+    async fn failed_undo_keeps_only_fixable_records(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        // Unfixable: the created item is already gone. Dropped, so older
+        // undos stay reachable.
+        ws.update(cx, |ws, cx| {
+            ws.undo_stack
+                .push(Undo::Created(vec![root.join("gone.txt")]));
+            ws.undo(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(ws.read_with(cx, |ws, _| ws.undo_stack.len()), 0);
+        // Fixable: something is in the way of the restore. Kept for a retry.
+        std::fs::write(root.join("in-the-way.txt"), b"x").unwrap();
+        std::fs::write(root.join("landed.txt"), b"y").unwrap();
+        ws.update(cx, |ws, cx| {
+            ws.undo_stack.push(Undo::Trashed(vec![(
+                root.join("in-the-way.txt"),
+                root.join("landed.txt"),
+            )]));
+            ws.undo(cx);
+            // A second ⌘Z while the first runs is refused, not interleaved.
+            ws.undo(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(ws.read_with(cx, |ws, _| ws.undo_stack.len()), 1);
     }
 }

@@ -81,11 +81,12 @@ impl Render for Tab {
             )
             .on_action(cx.listener(|tab, _: &OpenInNewTab, _, cx| tab.open_in_new_tab(cx)))
             .on_action(cx.listener(|tab, _: &GoBack, _, cx| tab.go_back(cx)))
-            // Space is bound to TogglePreview, and bindings run before
-            // on_key_down: let a type-to-select in progress take the space.
-            .on_action(cx.listener(|tab, _: &TogglePreview, _, cx| {
+            // Bindings run before on_key_down, so the Space key comes here as
+            // an action: a type-to-select in progress takes the space,
+            // otherwise it toggles the preview (menu / ⌥⌘P stay unaffected).
+            .on_action(cx.listener(|tab, _: &SpaceKey, window, cx| {
                 if !tab.type_select(" ", cx) {
-                    cx.propagate();
+                    window.dispatch_action(Box::new(TogglePreview), cx);
                 }
             }))
             .on_key_down(cx.listener(|tab, ev: &KeyDownEvent, _, cx| {

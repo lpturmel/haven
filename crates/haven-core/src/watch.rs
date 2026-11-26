@@ -16,7 +16,10 @@ type Aliases = Arc<Mutex<HashMap<PathBuf, Vec<PathBuf>>>>;
 /// canonical path and events are translated back to the path each tab uses.
 pub struct DirWatcher {
     watcher: RecommendedWatcher,
-    counts: HashMap<PathBuf, usize>,
+    /// Requested dir -> (ref count, canonical path resolved at watch time).
+    /// `unwatch` must use the same canonical path even if the folder has since
+    /// been deleted or a symlink retargeted.
+    counts: HashMap<PathBuf, (usize, PathBuf)>,
     aliases: Aliases,
 }
 
@@ -59,12 +62,12 @@ impl DirWatcher {
 
     /// Reference-counted watch so several tabs can share a directory.
     pub fn watch(&mut self, dir: &Path) {
-        let count = self.counts.entry(dir.to_path_buf()).or_insert(0);
-        *count += 1;
-        if *count > 1 {
+        if let Some((count, _)) = self.counts.get_mut(dir) {
+            *count += 1;
             return;
         }
         let canon = Self::canonical(dir);
+        self.counts.insert(dir.to_path_buf(), (1, canon.clone()));
         let first = {
             let mut map = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
             let list = map.entry(canon.clone()).or_default();
@@ -77,15 +80,16 @@ impl DirWatcher {
     }
 
     pub fn unwatch(&mut self, dir: &Path) {
-        let Some(count) = self.counts.get_mut(dir) else {
+        let Some((count, _)) = self.counts.get_mut(dir) else {
             return;
         };
         *count -= 1;
         if *count > 0 {
             return;
         }
-        self.counts.remove(dir);
-        let canon = Self::canonical(dir);
+        let Some((_, canon)) = self.counts.remove(dir) else {
+            return;
+        };
         let last = {
             let mut map = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
             match map.get_mut(&canon) {
@@ -154,5 +158,26 @@ mod tests {
         assert_eq!(got, root.join("link"));
         w.unwatch(&root.join("link"));
         assert!(w.aliases.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unwatch_after_the_folder_is_gone_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let mut w = DirWatcher::new(|_| {}).unwrap();
+        w.watch(&root.join("link"));
+        // The symlink disappears before the tab stops watching it.
+        std::fs::remove_file(root.join("link")).unwrap();
+        w.unwatch(&root.join("link"));
+        assert!(w.counts.is_empty());
+        assert!(w.aliases.lock().unwrap().is_empty());
+        // Watching the real folder later is a fresh, working watch.
+        w.watch(&root.join("real"));
+        assert_eq!(
+            w.aliases.lock().unwrap().get(&root.join("real")),
+            Some(&vec![root.join("real")])
+        );
     }
 }

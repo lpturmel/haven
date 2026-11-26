@@ -202,6 +202,15 @@ impl Undo {
     }
 }
 
+/// A hidden temporary name unique across this process: concurrent operations
+/// (two undos, an undo and a bulk rename) must never pick the same one, since
+/// `rename` silently replaces an existing file.
+fn temp_name(kind: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(".haven-{kind}-{}-{n}", std::process::id())
+}
+
 /// Reverses `(from, to)` moves: everything at `to` goes back to `from`.
 ///
 /// Two-phase through temporary names, so overlapping records (a bulk rename
@@ -224,8 +233,7 @@ fn undo_moves(pairs: &[(PathBuf, PathBuf)]) -> io::Result<Undo> {
     }
     let temps: Vec<PathBuf> = pairs
         .iter()
-        .enumerate()
-        .map(|(i, (_, to))| to.with_file_name(format!(".haven-undo-{}-{i}", std::process::id())))
+        .map(|(_, to)| to.with_file_name(temp_name("undo")))
         .collect();
     for (i, ((_, to), tmp)) in pairs.iter().zip(&temps).enumerate() {
         if let Err(e) = fs::rename(to, tmp) {
@@ -670,8 +678,7 @@ impl BulkRename {
     ) -> io::Result<Undo> {
         let temps: Vec<PathBuf> = paths
             .iter()
-            .enumerate()
-            .map(|(i, p)| p.with_file_name(format!(".haven-rename-{}-{i}", std::process::id())))
+            .map(|p| p.with_file_name(temp_name("rename")))
             .collect();
         for (i, (p, tmp)) in paths.iter().zip(&temps).enumerate() {
             if let Err(e) = rename(p, tmp) {
@@ -1145,5 +1152,29 @@ mod tests {
         .unwrap();
         assert_eq!(p.total_items.load(Ordering::Relaxed), 5);
         assert!((p.fraction() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn concurrent_undos_in_one_folder_never_clobber_each_other() {
+        let (_d, root) = setup();
+        let mut records = Vec::new();
+        for i in 0..16 {
+            fs::write(root.join(format!("moved-{i}")), format!("{i}")).unwrap();
+            records.push(Undo::Moved(vec![(
+                root.join(format!("orig-{i}")),
+                root.join(format!("moved-{i}")),
+            )]));
+        }
+        std::thread::scope(|s| {
+            for r in &records {
+                s.spawn(move || r.apply().unwrap());
+            }
+        });
+        for i in 0..16 {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("orig-{i}"))).unwrap(),
+                format!("{i}")
+            );
+        }
     }
 }

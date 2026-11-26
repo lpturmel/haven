@@ -1,6 +1,6 @@
 //! Native Finder icons, rendered off the main thread and cached by type.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,7 +31,13 @@ impl IconSize {
 pub struct IconCache {
     map: HashMap<(String, IconSize), Option<Arc<Image>>>,
     pending: HashSet<(String, IconSize)>,
+    /// Per-file thumbnails in insertion order, evicted beyond `MAX_THUMBS`
+    /// (type icons are few and stay cached).
+    thumbs: VecDeque<(String, IconSize)>,
 }
+
+/// Per-file image thumbnails kept in memory.
+const MAX_THUMBS: usize = 400;
 
 impl Global for IconCache {}
 
@@ -79,12 +85,20 @@ impl IconCache {
 }
 
 pub fn entry_icon(entry: &Entry, size: IconSize, cx: &mut App) -> Option<Arc<Image>> {
-    path_icon(
+    // Thumbnails are keyed by size + mtime too, so a file changed in place
+    // (or read mid-copy) gets a fresh one.
+    let mtime = entry
+        .modified
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    icon(
         &entry.path,
         entry.is_dir,
         entry.is_package,
         &entry.ext,
         size,
+        &format!("{}:{mtime}", entry.size),
         cx,
     )
 }
@@ -97,11 +111,23 @@ pub fn path_icon(
     size: IconSize,
     cx: &mut App,
 ) -> Option<Arc<Image>> {
+    icon(path, is_dir, is_package, ext, size, "", cx)
+}
+
+fn icon(
+    path: &Path,
+    is_dir: bool,
+    is_package: bool,
+    ext: &str,
+    size: IconSize,
+    stamp: &str,
+    cx: &mut App,
+) -> Option<Arc<Image>> {
     let source = source_for(path, is_dir, is_package, ext);
     let key = match &source {
         Source::Type(t) => (format!("t:{t}"), size),
         Source::Path(p) => (format!("p:{p}"), size),
-        Source::Thumb(p) => (format!("i:{p}"), size),
+        Source::Thumb(p) => (format!("i:{p}@{stamp}"), size),
     };
     let cache = cx.global::<IconCache>();
     if let Some(hit) = cache.map.get(&key) {
@@ -126,6 +152,14 @@ pub fn path_icon(
         let _ = cx.update(|cx| {
             let cache = cx.global_mut::<IconCache>();
             cache.pending.remove(&key);
+            if key.0.starts_with("i:") {
+                cache.thumbs.push_back(key.clone());
+                while cache.thumbs.len() > MAX_THUMBS {
+                    if let Some(old) = cache.thumbs.pop_front() {
+                        cache.map.remove(&old);
+                    }
+                }
+            }
             cache.map.insert(key, image);
             cx.refresh_windows();
         });

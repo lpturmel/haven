@@ -28,6 +28,7 @@ actions!(
         GoHomeFolder,
         Refresh,
         UndoOp,
+        SpaceKey,
         CopyPath,
         NewFolder,
         PasteFiles,
@@ -191,7 +192,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-t", EditTags, fv),
         KeyBinding::new("cmd-ctrl-t", PinToSidebar, fv),
         KeyBinding::new("cmd-i", GetInfo, fv),
-        KeyBinding::new("space", TogglePreview, fv),
+        // Space continues a type-to-select in progress, else toggles preview.
+        KeyBinding::new("space", SpaceKey, fv),
         KeyBinding::new("cmd-alt-r", RevealSelected, fv),
     ]);
 }
