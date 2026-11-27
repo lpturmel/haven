@@ -1607,7 +1607,15 @@ pub fn refresh_start_data(cx: &mut App) {
         let rec = if fresh {
             None
         } else {
-            let merged = recents::merge(history, recents::spotlight_recents(14), 40);
+            // Tests never query Spotlight: its results are the owner's real
+            // files, and reading their tags can block for as long as a macOS
+            // privacy prompt waits on screen, hanging every view test.
+            let spotlight = if cfg!(test) {
+                Vec::new()
+            } else {
+                recents::spotlight_recents(14)
+            };
+            let merged = recents::merge(history, spotlight, 40);
             let entries: Vec<Option<Entry>> = merged
                 .iter()
                 .map(|r| Entry::from_path(&r.path).ok())
