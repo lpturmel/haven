@@ -1,6 +1,32 @@
 diff
+--- a/src/interactive.rs	2006-07-23 21:21:28
++++ b/src/interactive.rs	2026-11-26 22:31:54
+@@ -503,6 +503,22 @@
+     }
+ }
+ 
++/// HAVEN PATCH: whether the source of the current (or last) external file
++/// drag allows moving its files. Apps that hand out their own data (editor
++/// file trees, attachment caches) usually allow only copying; Finder allows
++/// both. See vendor/gpui/HAVEN_PATCHES.md.
++static EXTERNAL_DRAG_ALLOWS_MOVE: std::sync::atomic::AtomicBool =
++    std::sync::atomic::AtomicBool::new(false);
++
++/// See [`EXTERNAL_DRAG_ALLOWS_MOVE`].
++pub fn external_drag_allows_move() -> bool {
++    EXTERNAL_DRAG_ALLOWS_MOVE.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++pub(crate) fn set_external_drag_allows_move(allows: bool) {
++    EXTERNAL_DRAG_ALLOWS_MOVE.store(allows, std::sync::atomic::Ordering::Relaxed);
++}
++
+ impl Render for ExternalPaths {
+     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+         // the platform will render icons for the dragged files
+diff
 --- a/src/platform/mac/text_system.rs	2006-07-23 21:21:28
-+++ b/src/platform/mac/text_system.rs	2026-11-26 21:42:04
++++ b/src/platform/mac/text_system.rs	2026-11-26 22:07:23
 @@ -18,6 +18,7 @@
      color_space::CGColorSpace,
      context::{CGContext, CGTextDrawingMode},
@@ -124,7 +150,7 @@ diff
              Ok((bitmap_size, bytes))
 diff
 --- a/src/platform/mac/window.rs	2006-07-23 21:21:28
-+++ b/src/platform/mac/window.rs	2026-11-26 21:46:56
++++ b/src/platform/mac/window.rs	2026-11-26 22:31:54
 @@ -1875,6 +1875,16 @@
                  lock.synthetic_drag_counter += 1;
              }
@@ -142,9 +168,72 @@ diff
              PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                  modifiers,
                  capslock,
+@@ -2371,11 +2381,30 @@
+         && send_new_event(&window_state, event)
+     {
+         window_state.lock().external_files_dragged = true;
+-        return NSDragOperationCopy;
++        return drag_operation(dragging_info);
+     }
+     NSDragOperationNone
+ }
+ 
++/// HAVEN PATCH: records whether the drag source allows moving, and returns
++/// the operation the drop will most likely perform so the cursor badge is
++/// honest: a move (no badge) when the source allows it and ⌥ isn't held,
++/// else a copy ("+"). The app still decides per destination (copy across
++/// volumes).
++fn drag_operation(dragging_info: id) -> NSDragOperation {
++    const MOVE: NSDragOperation = 16;
++    const OPTION: u64 = 1 << 19;
++    let mask: NSDragOperation = unsafe { msg_send![dragging_info, draggingSourceOperationMask] };
++    let flags: u64 = unsafe { msg_send![class!(NSEvent), modifierFlags] };
++    let allows_move = mask & MOVE != 0;
++    crate::set_external_drag_allows_move(allows_move);
++    if allows_move && flags & OPTION == 0 {
++        MOVE
++    } else {
++        NSDragOperationCopy
++    }
++}
++
+ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
+     let window_state = unsafe { get_window_state(this) };
+     let position = drag_event_position(&window_state, dragging_info);
+@@ -2383,7 +2412,7 @@
+         &window_state,
+         PlatformInput::FileDrop(FileDropEvent::Pending { position }),
+     ) {
+-        NSDragOperationCopy
++        drag_operation(dragging_info)
+     } else {
+         NSDragOperationNone
+     }
+@@ -2400,6 +2429,7 @@
+ 
+ extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -> BOOL {
+     let window_state = unsafe { get_window_state(this) };
++    drag_operation(dragging_info);
+     let position = drag_event_position(&window_state, dragging_info);
+     send_new_event(
+         &window_state,
+@@ -2442,6 +2472,13 @@
+         Timer::after(Duration::from_millis(16)).await;
+         if let Some(window_state) = window_state.upgrade() {
+             let mut lock = window_state.lock();
++            // HAVEN PATCH: a native drag session may have eaten the mouse-up
++            // (and the cursor may never come back over this window): stop
++            // replaying as soon as no mouse button is actually held.
++            let pressed: NSUInteger = unsafe { msg_send![class!(NSEvent), pressedMouseButtons] };
++            if pressed == 0 {
++                lock.synthetic_drag_counter += 1;
++            }
+             if lock.synthetic_drag_counter == drag_id {
+                 if let Some(mut callback) = lock.event_callback.take() {
+                     drop(lock);
 diff
 --- a/src/taffy.rs	2006-07-23 21:21:28
-+++ b/src/taffy.rs	2026-11-26 21:48:28
++++ b/src/taffy.rs	2026-11-26 22:07:23
 @@ -309,7 +309,7 @@
              unit: &Option<u16>,
          ) -> Vec<taffy::GridTemplateComponent<T>> {
@@ -156,7 +245,7 @@ diff
  
 diff
 --- a/src/text_system.rs	2006-07-23 21:21:28
-+++ b/src/text_system.rs	2026-11-26 21:42:04
++++ b/src/text_system.rs	2026-11-26 22:35:56
 @@ -767,6 +767,9 @@
      pub(crate) subpixel_variant: Point<u8>,
      pub(crate) scale_factor: f32,
@@ -175,10 +264,12 @@ diff
      }
  }
  
-@@ -905,6 +909,23 @@
- }
- 
- #[allow(unused)]
+@@ -902,6 +906,23 @@
+     pub fn bounding_box(&self, font_size: Pixels) -> Bounds<Pixels> {
+         (self.bounding_box / self.units_per_em as f32 * font_size.0).map(px)
+     }
++}
++
 +/// Whether glyphs are rasterized with font smoothing (CoreText's "stem
 +/// darkening", which native macOS text uses). Without it gpui's text is
 +/// thinner and softer than AppKit's, most visibly on non-Retina displays.
@@ -194,14 +285,12 @@ diff
 +/// Whether font smoothing is enabled (see [`set_font_smoothing`]).
 +pub fn font_smoothing() -> bool {
 +    FONT_SMOOTHING.load(std::sync::atomic::Ordering::Relaxed)
-+}
-+
- pub(crate) fn font_name_with_fallbacks<'a>(name: &'a str, system: &'a str) -> &'a str {
-     // Note: the "Zed Plex" fonts were deprecated as we are not allowed to use "Plex"
-     // in a derived font name. They are essentially indistinguishable from IBM Plex/Lilex,
+ }
+ 
+ #[allow(unused)]
 diff
 --- a/src/window.rs	2006-07-23 21:21:28
-+++ b/src/window.rs	2026-11-26 21:42:04
++++ b/src/window.rs	2026-11-26 22:07:23
 @@ -2970,6 +2970,7 @@
              subpixel_variant,
              scale_factor,

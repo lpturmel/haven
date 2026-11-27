@@ -13,8 +13,19 @@ Code:
   synthetic-drag replay never stops after a native drag. See
   `vendor/gpui/HAVEN_PATCHES.md`.
 
-Drop rules (same for both sources): move within a volume, copy across
-volumes, ⌥ forces a copy. Dropping a folder onto itself is ignored.
+Drop rules (`views::must_copy`, unit-tested):
+- move within a volume and copy across volumes;
+- ⌥ forces a copy. It's read live from AppKit, because gpui's cached
+  modifiers miss ⌥ while another app owns the drag;
+- drags from apps that don't allow moving (an editor's file tree, a mail
+  attachment) always copy, via `gpui::external_drag_allows_move()`;
+- the cursor shows a "+" badge when the drop will copy and none when it will
+  move;
+- dropping a folder onto itself (its tab, sidebar row or crumb) is ignored.
+
+The drag source stays alive in a thread-local until
+`draggingSession:endedAtPoint:operation:`. Run one drag-out with
+`--env NSZombieEnabled=YES` to confirm there's no use-after-free.
 
 ## Fixture
 
@@ -33,7 +44,7 @@ For each target, drag `one.txt` (then a two-file selection) from Finder:
 
 | Target | Expect |
 |---|---|
-| List view background | file lands in `$DST` (moved: `$SRC` is on the same volume) |
+| List view background | file lands in `$DST` (moved: `$SRC` is on the same volume; no "+" badge while hovering) |
 | List row `inbox` | row highlights while hovered; file lands in `$DST/inbox` |
 | Grid tile `inbox` (⌥⌘2) | same, tile highlights |
 | Columns view (⌥⌘3) current column, and folder rows | lands in the folder |
@@ -42,7 +53,10 @@ For each target, drag `one.txt` (then a two-file selection) from Finder:
 | A tab in the tab strip | lands in that tab's folder |
 | A path-bar crumb | lands in that ancestor |
 
-Hold ⌥ while dropping: the source file stays (copy). Check every result
+Hold ⌥ while dropping (pressed *during* the drag, Haven not active): the
+cursor gains a "+" and the source file stays (copy). Drag a file from an app
+that only lends a copy (VS Code's Explorer, for example) onto a same-volume
+folder: it's copied, not moved. Check every result
 with `ls`. The folder view refreshes live with no ⌘R.
 
 ## Drag out (Haven → other apps)

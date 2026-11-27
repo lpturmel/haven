@@ -110,6 +110,11 @@ pub struct UnpinSidebar(pub PathBuf);
 #[action(namespace = haven, no_json)]
 pub struct EjectVolume(pub PathBuf);
 
+/// Eject confirmed although other volumes on the same disk go too.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = haven, no_json)]
+pub struct EjectVolumeConfirmed(pub PathBuf);
+
 /// Confirmed default-viewer change.
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = haven, no_json)]

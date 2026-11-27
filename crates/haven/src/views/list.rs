@@ -1,16 +1,16 @@
 //! Detail list view with sortable, multi-key column headers.
 
 use gpui::{
-    AnyElement, Context, ExternalPaths, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
-    canvas, div, prelude::FluentBuilder, px, uniform_list,
+    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, canvas, div,
+    prelude::FluentBuilder, px, uniform_list,
 };
 use haven_core::kind::kind_label;
 use haven_core::{SortKey, fmt};
 
 use super::{drag_payload, drag_preview, entry_icon_el, file_drop_target};
 use crate::store::Store;
-use crate::tab::{DraggedFiles, Location, Tab};
+use crate::tab::{Location, Tab};
 use crate::theme::theme;
 use crate::ui::Ellipsis as _;
 use crate::ui::{empty_state, icon, tag_dot};
@@ -219,15 +219,12 @@ pub fn render(tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> Any
                     }),
                 )
                 .when_some(dest, |d, dest| {
-                    let dest2 = dest.clone();
-                    d.on_drop(cx.listener(move |tab, files: &DraggedFiles, window, cx| {
-                        tab.drop_on(dest.clone(), files.paths.clone(), window, cx);
-                    }))
-                    .on_drop(cx.listener(
-                        move |tab, ext: &ExternalPaths, window, cx| {
-                            tab.drop_on(dest2.clone(), ext.paths().to_vec(), window, cx);
-                        },
-                    ))
+                    file_drop_target(
+                        d,
+                        gpui::transparent_black(),
+                        cx,
+                        move |tab, dropped, _, cx| tab.drop_on(dest.clone(), dropped, cx),
+                    )
                 })
                 .child(body),
         )
@@ -263,9 +260,11 @@ fn row(tab: &mut Tab, ix: usize, cols: Columns, cx: &mut Context<Tab>) -> AnyEle
         .text_size(px(13.))
         .when(selected, |d| d.bg(t.selection))
         .when(!selected, |d| d.hover(|s| s.bg(t.hover)))
-        .when(focused && !selected, |d| {
-            d.border_1().border_color(t.selection)
-        })
+        // The cursor ring is a border on every row (transparent unless it
+        // is the cursor), so it doesn't shift the row's content by a pixel.
+        .border_1()
+        .border_color(gpui::transparent_black())
+        .when(focused && !selected, |d| d.border_color(t.selection))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |tab, ev: &MouseDownEvent, window, cx| {
@@ -283,9 +282,9 @@ fn row(tab: &mut Tab, ix: usize, cols: Columns, cx: &mut Context<Tab>) -> AnyEle
         .on_click(cx.listener(move |tab, _, _, cx| tab.click_item(ix, cx)))
         .on_drag(payload, |files, _, _, cx| drag_preview(files, cx))
         .when(navigable, |d| {
-            file_drop_target(d, t.selection, cx, move |tab, paths, window, cx| {
-                if !paths.contains(&path) {
-                    tab.drop_on(path.clone(), paths, window, cx);
+            file_drop_target(d, t.selection, cx, move |tab, dropped, _, cx| {
+                if !dropped.paths.contains(&path) {
+                    tab.drop_on(path.clone(), dropped, cx);
                 }
             })
         })

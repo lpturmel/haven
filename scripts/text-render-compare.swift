@@ -61,7 +61,6 @@ func coverage(_ text: String, smooth: Bool, snap: Bool) -> (w: Int, h: Int, a: [
         for i in 0..<n {
             // Device-space origin of this glyph (gpui: origin.scale(sf)).
             var ox = (8 + pos[i].x) * scale
-            let oy = baseline * scale
             if snap { ox = ox.rounded() }
             // gpui: 4 subpixel x variants, floor of the origin.
             let variant = snap ? 0 : (ox - ox.rounded(.down)) * 4

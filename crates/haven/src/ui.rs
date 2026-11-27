@@ -19,8 +19,21 @@ pub fn icon_sized(name: &str, size: Pixels, color: Hsla) -> Svg {
 
 /// A square icon button with hover state.
 pub fn icon_button(id: impl Into<ElementId>, name: &str, cx: &App) -> gpui::Stateful<Div> {
+    icon_button_state(id, name, true, false, cx)
+}
+
+/// An icon button that may be disabled (faded, no hover) or "on" (keeps its
+/// active fill under the pointer). gpui allows one `hover` per element, so
+/// the state is decided here rather than layered on by callers.
+pub fn icon_button_state(
+    id: impl Into<ElementId>,
+    name: &str,
+    enabled: bool,
+    on: bool,
+    cx: &App,
+) -> gpui::Stateful<Div> {
     let t = theme(cx);
-    div()
+    let base = div()
         .id(id)
         .flex()
         .items_center()
@@ -28,10 +41,16 @@ pub fn icon_button(id: impl Into<ElementId>, name: &str, cx: &App) -> gpui::Stat
         .size(px(26.))
         .rounded(px(6.))
         .text_color(t.text_muted)
-        .hover(|s| s.bg(t.hover))
-        .active(|s| s.bg(t.active))
-        .cursor_pointer()
-        .child(icon(name).size(px(15.)).text_color(t.text_muted))
+        .child(icon(name).size(px(15.)).text_color(t.text_muted));
+    if !enabled {
+        base.opacity(0.35).cursor_default()
+    } else if on {
+        base.bg(t.active).cursor_pointer()
+    } else {
+        base.hover(|s| s.bg(t.hover))
+            .active(|s| s.bg(t.active))
+            .cursor_pointer()
+    }
 }
 
 pub fn text_button(

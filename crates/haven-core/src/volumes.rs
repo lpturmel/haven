@@ -164,11 +164,138 @@ fn diskutil(verb: &str, mount: &Path) -> Result<(), String> {
     }
 }
 
-/// Ejects a volume via `diskutil` (blocking). Network shares (SMB, AFP,
-/// NFS) have no disk device to eject, so they are unmounted instead; a
-/// local volume whose disk can't be ejected (a second partition of the
-/// internal disk) falls back to an unmount too.
-pub fn eject(mount: &Path) -> Result<(), String> {
+/// What `diskutil info` says about the disk behind a volume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiskInfo {
+    /// The physical whole disk ("disk4"). For APFS volumes this is the disk
+    /// holding the container's physical store, not the synthesized container.
+    pub physical_disk: String,
+    pub internal: bool,
+    pub ejectable: bool,
+}
+
+/// "disk4s2" → "disk4".
+fn whole_disk(dev: &str) -> String {
+    let digits_end = dev
+        .strip_prefix("disk")
+        .map(|rest| 4 + rest.chars().take_while(char::is_ascii_digit).count())
+        .unwrap_or(dev.len());
+    dev[..digits_end].to_string()
+}
+
+/// Parses `diskutil info -plist <mount>`.
+pub fn parse_disk_info(plist_bytes: &[u8]) -> Option<DiskInfo> {
+    let value: plist::Value = plist::from_bytes(plist_bytes).ok()?;
+    let dict = value.as_dictionary()?;
+    let flag = |k: &str| dict.get(k).and_then(|v| v.as_boolean()).unwrap_or(false);
+    let store = dict
+        .get("APFSPhysicalStores")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_dictionary())
+        .and_then(|d| d.get("APFSPhysicalStore"))
+        .and_then(|v| v.as_string());
+    let parent = dict.get("ParentWholeDisk").and_then(|v| v.as_string());
+    let physical_disk = whole_disk(store.or(parent)?);
+    Some(DiskInfo {
+        physical_disk,
+        internal: flag("Internal"),
+        ejectable: flag("Ejectable") || flag("RemovableMediaOrExternalDevice"),
+    })
+}
+
+/// `diskutil info` for a mount point (blocking).
+pub fn disk_info(mount: &Path) -> Option<DiskInfo> {
+    let out = Command::new("/usr/sbin/diskutil")
+        .args(["info", "-plist"])
+        .arg(mount)
+        .output()
+        .ok()?;
+    out.status.success().then(|| parse_disk_info(&out.stdout))?
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EjectMode {
+    /// Eject the whole physical disk (and every volume on it).
+    Eject,
+    /// Only unmount this volume; its disk stays attached (internal disks,
+    /// the startup disk, network shares, unknown disks).
+    Unmount,
+}
+
+/// How to take a volume away, decided before touching anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EjectPlan {
+    pub mount: PathBuf,
+    pub mode: EjectMode,
+    /// Other mounted volumes on the same physical disk: ejecting takes them
+    /// too, so the user is asked first and their tabs are moved away.
+    pub siblings: Vec<PathBuf>,
+}
+
+/// Pure decision for [`eject_plan`]: `disks` maps mounted volumes to their
+/// disk, `boot` is the startup volume's disk.
+pub fn plan_eject(
+    mount: &Path,
+    disks: &[(PathBuf, DiskInfo)],
+    boot: Option<&DiskInfo>,
+) -> EjectPlan {
+    let unmount = EjectPlan {
+        mount: mount.to_path_buf(),
+        mode: EjectMode::Unmount,
+        siblings: Vec::new(),
+    };
+    let Some((_, me)) = disks.iter().find(|(m, _)| m == mount) else {
+        return unmount;
+    };
+    let on_boot_disk = boot.is_some_and(|b| b.physical_disk == me.physical_disk);
+    if on_boot_disk || (me.internal && !me.ejectable) {
+        return unmount;
+    }
+    let siblings = disks
+        .iter()
+        .filter(|(m, d)| m != mount && m != Path::new("/") && d.physical_disk == me.physical_disk)
+        .map(|(m, _)| m.clone())
+        .collect();
+    EjectPlan {
+        mount: mount.to_path_buf(),
+        mode: EjectMode::Eject,
+        siblings,
+    }
+}
+
+/// Plans ejecting the volume mounted at `mount` (blocking: runs `diskutil
+/// info` for each mounted volume). Anything that isn't a listed mount point
+/// gets an unmount plan, which [`eject`] turns into a no-op.
+pub fn eject_plan(mount: &Path) -> EjectPlan {
+    if !is_mount_point(mount) {
+        return plan_eject(mount, &[], None);
+    }
+    if !is_local(mount) {
+        return plan_eject(mount, &[], None);
+    }
+    let vols = list_volumes();
+    let boot = disk_info(Path::new("/"));
+    let disks: Vec<(PathBuf, DiskInfo)> = vols
+        .iter()
+        .filter(|v| v.ejectable && v.local)
+        .filter_map(|v| disk_info(&v.mount).map(|d| (v.mount.clone(), d)))
+        .collect();
+    plan_eject(mount, &disks, boot.as_ref())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EjectOutcome {
+    /// The disk is gone: it can be unplugged.
+    Ejected,
+    /// The volume is unmounted; its disk is still attached.
+    Unmounted,
+}
+
+/// Carries out an [`EjectPlan`] (blocking). Reports `Ejected` only when the
+/// volume and all its siblings really went away.
+pub fn eject(plan: &EjectPlan) -> Result<EjectOutcome, String> {
+    let mount = plan.mount.as_path();
     if mount == Path::new("/") {
         return Err("the startup disk can't be ejected".into());
     }
@@ -176,16 +303,30 @@ pub fn eject(mount: &Path) -> Result<(), String> {
     // hand it an actual mount point, or a stray path could eject (or try to
     // eject) the disk it lives on.
     if !is_mount_point(mount) {
-        return Ok(());
+        return Ok(EjectOutcome::Ejected);
     }
-    if !is_local(mount) {
-        return diskutil("unmount", mount);
+    if plan.mode == EjectMode::Unmount || !is_local(mount) {
+        return diskutil("unmount", mount).map(|()| EjectOutcome::Unmounted);
     }
-    match diskutil("eject", mount) {
-        Ok(()) => Ok(()),
-        // Some disks report an error although the volume did go away.
-        Err(_) if !is_mount_point(mount) => Ok(()),
-        Err(e) => diskutil("unmount", mount).map_err(|_| e),
+    let result = diskutil("eject", mount);
+    let still: Vec<&PathBuf> = std::iter::once(&plan.mount)
+        .chain(&plan.siblings)
+        .filter(|m| is_mount_point(m))
+        .collect();
+    match (result, still.first()) {
+        // Some disks report an error although everything did go away.
+        (_, None) => Ok(EjectOutcome::Ejected),
+        (Err(e), Some(m)) if *m == &plan.mount => Err(e),
+        (r, Some(m)) => {
+            let name = m
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| m.display().to_string());
+            let why = r
+                .err()
+                .unwrap_or_else(|| "it's in use by another app".into());
+            Err(format!("“{name}” on the same disk is still mounted: {why}"))
+        }
     }
 }
 
@@ -256,14 +397,80 @@ mod tests {
     #[test]
     fn ejecting_an_unmounted_path_is_a_no_op() {
         // Nothing is mounted there, so there is nothing left to eject.
-        assert_eq!(
-            eject(Path::new("/Volumes/haven-definitely-not-mounted")),
-            Ok(())
-        );
+        let gone = Path::new("/Volumes/haven-definitely-not-mounted");
+        assert_eq!(eject_plan(gone).mode, EjectMode::Unmount);
+        assert_eq!(eject(&eject_plan(gone)), Ok(EjectOutcome::Ejected));
         // A folder on the boot volume is not a mount point: diskutil must
         // never see it (it would resolve it to the startup disk).
-        assert_eq!(eject(&std::env::temp_dir()), Ok(()));
-        assert!(eject(Path::new("/")).is_err());
+        let tmp = std::env::temp_dir();
+        assert_eq!(eject(&eject_plan(&tmp)), Ok(EjectOutcome::Ejected));
+        assert!(eject(&eject_plan(Path::new("/"))).is_err());
+    }
+
+    fn disk(physical: &str, internal: bool, ejectable: bool) -> DiskInfo {
+        DiskInfo {
+            physical_disk: physical.into(),
+            internal,
+            ejectable,
+        }
+    }
+
+    #[test]
+    fn plans_whole_disk_ejects_with_siblings() {
+        let boot = disk("disk0", true, false);
+        let disks = vec![
+            (PathBuf::from("/Volumes/A"), disk("disk8", false, true)),
+            (PathBuf::from("/Volumes/B"), disk("disk8", false, true)),
+            (PathBuf::from("/Volumes/USB"), disk("disk9", false, true)),
+        ];
+        let plan = plan_eject(Path::new("/Volumes/A"), &disks, Some(&boot));
+        assert_eq!(plan.mode, EjectMode::Eject);
+        assert_eq!(plan.siblings, vec![PathBuf::from("/Volumes/B")]);
+        let plan = plan_eject(Path::new("/Volumes/USB"), &disks, Some(&boot));
+        assert_eq!((plan.mode, plan.siblings.len()), (EjectMode::Eject, 0));
+    }
+
+    #[test]
+    fn internal_and_boot_disk_volumes_are_only_unmounted() {
+        let boot = disk("disk0", true, false);
+        let disks = vec![
+            // An extra APFS volume in the startup container.
+            (PathBuf::from("/Volumes/Data2"), disk("disk0", true, false)),
+            // A second internal disk.
+            (PathBuf::from("/Volumes/Inner"), disk("disk2", true, false)),
+            // An SD card in the built-in reader: internal but ejectable.
+            (PathBuf::from("/Volumes/SD"), disk("disk3", true, true)),
+        ];
+        let plan = |m: &str| plan_eject(Path::new(m), &disks, Some(&boot));
+        assert_eq!(plan("/Volumes/Data2").mode, EjectMode::Unmount);
+        assert!(plan("/Volumes/Data2").siblings.is_empty());
+        assert_eq!(plan("/Volumes/Inner").mode, EjectMode::Unmount);
+        assert_eq!(plan("/Volumes/SD").mode, EjectMode::Eject);
+        // Unknown volume: the safe choice.
+        assert_eq!(plan("/Volumes/Unknown").mode, EjectMode::Unmount);
+    }
+
+    #[test]
+    fn parses_diskutil_info() {
+        let apfs = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>APFSPhysicalStores</key><array><dict><key>APFSPhysicalStore</key><string>disk6s1</string></dict></array>
+<key>Ejectable</key><true/><key>Internal</key><false/>
+<key>ParentWholeDisk</key><string>disk7</string>
+</dict></plist>"#;
+        assert_eq!(parse_disk_info(apfs), Some(disk("disk6", false, true)));
+        let hfs = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Ejectable</key><false/><key>Internal</key><true/>
+<key>RemovableMediaOrExternalDevice</key><false/>
+<key>ParentWholeDisk</key><string>disk12</string>
+</dict></plist>"#;
+        assert_eq!(parse_disk_info(hfs), Some(disk("disk12", true, false)));
+        assert_eq!(parse_disk_info(b"not a plist"), None);
+        assert_eq!(whole_disk("disk10s2s1"), "disk10");
+        // The real startup volume parses and is internal.
+        let boot = disk_info(Path::new("/")).expect("diskutil info /");
+        assert!(boot.internal && boot.physical_disk.starts_with("disk"));
     }
 
     /// Ejects a real volume. Mount a scratch disk image first:
@@ -284,12 +491,14 @@ mod tests {
         let busy = mount.join("haven-busy.txt");
         std::fs::write(&busy, b"busy").unwrap();
         let handle = std::fs::File::open(&busy).unwrap();
-        let err = eject(&mount).expect_err("busy volume must not eject");
+        let plan = eject_plan(&mount);
+        assert_eq!(plan.mode, EjectMode::Eject);
+        let err = eject(&plan).expect_err("busy volume must not eject");
         assert_eq!(err, "it's in use by another app");
         assert!(listed(&mount));
         drop(handle);
         std::fs::remove_file(&busy).unwrap();
-        assert_eq!(eject(&mount), Ok(()));
+        assert_eq!(eject(&plan), Ok(EjectOutcome::Ejected));
         assert!(!listed(&mount));
     }
 }

@@ -891,12 +891,14 @@ impl Tab {
     pub fn drop_on(
         &mut self,
         dest: PathBuf,
-        paths: Vec<PathBuf>,
-        window: &Window,
+        dropped: crate::views::Dropped,
         cx: &mut Context<Self>,
     ) {
-        let copy = window.modifiers().alt;
-        cx.emit(TabEvent::Drop { paths, dest, copy });
+        cx.emit(TabEvent::Drop {
+            paths: dropped.paths,
+            dest,
+            copy: dropped.copy,
+        });
     }
 
     // ---------------------------------------------------------------- columns

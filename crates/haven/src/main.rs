@@ -84,6 +84,8 @@ fn open_window(cx: &mut App, args: Vec<PathBuf>) -> WindowHandle<Workspace> {
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // gpui reads `bounds` relative to this display (primary if None).
+            display_id: target_display(cx),
             titlebar: Some(TitlebarOptions {
                 title: Some("Haven".into()),
                 appears_transparent: true,

@@ -2381,9 +2381,28 @@ extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDr
         && send_new_event(&window_state, event)
     {
         window_state.lock().external_files_dragged = true;
-        return NSDragOperationCopy;
+        return drag_operation(dragging_info);
     }
     NSDragOperationNone
+}
+
+/// HAVEN PATCH: records whether the drag source allows moving, and returns
+/// the operation the drop will most likely perform so the cursor badge is
+/// honest: a move (no badge) when the source allows it and ⌥ isn't held,
+/// else a copy ("+"). The app still decides per destination (copy across
+/// volumes).
+fn drag_operation(dragging_info: id) -> NSDragOperation {
+    const MOVE: NSDragOperation = 16;
+    const OPTION: u64 = 1 << 19;
+    let mask: NSDragOperation = unsafe { msg_send![dragging_info, draggingSourceOperationMask] };
+    let flags: u64 = unsafe { msg_send![class!(NSEvent), modifierFlags] };
+    let allows_move = mask & MOVE != 0;
+    crate::set_external_drag_allows_move(allows_move);
+    if allows_move && flags & OPTION == 0 {
+        MOVE
+    } else {
+        NSDragOperationCopy
+    }
 }
 
 extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
@@ -2393,7 +2412,7 @@ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDr
         &window_state,
         PlatformInput::FileDrop(FileDropEvent::Pending { position }),
     ) {
-        NSDragOperationCopy
+        drag_operation(dragging_info)
     } else {
         NSDragOperationNone
     }
@@ -2410,6 +2429,7 @@ extern "C" fn dragging_exited(this: &Object, _: Sel, _: id) {
 
 extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -> BOOL {
     let window_state = unsafe { get_window_state(this) };
+    drag_operation(dragging_info);
     let position = drag_event_position(&window_state, dragging_info);
     send_new_event(
         &window_state,
@@ -2452,6 +2472,13 @@ async fn synthetic_drag(
         Timer::after(Duration::from_millis(16)).await;
         if let Some(window_state) = window_state.upgrade() {
             let mut lock = window_state.lock();
+            // HAVEN PATCH: a native drag session may have eaten the mouse-up
+            // (and the cursor may never come back over this window): stop
+            // replaying as soon as no mouse button is actually held.
+            let pressed: NSUInteger = unsafe { msg_send![class!(NSEvent), pressedMouseButtons] };
+            if pressed == 0 {
+                lock.synthetic_drag_counter += 1;
+            }
             if lock.synthetic_drag_counter == drag_id {
                 if let Some(mut callback) = lock.event_callback.take() {
                     drop(lock);

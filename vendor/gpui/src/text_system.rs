@@ -908,7 +908,6 @@ impl FontMetrics {
     }
 }
 
-#[allow(unused)]
 /// Whether glyphs are rasterized with font smoothing (CoreText's "stem
 /// darkening", which native macOS text uses). Without it gpui's text is
 /// thinner and softer than AppKit's, most visibly on non-Retina displays.
@@ -926,6 +925,7 @@ pub fn font_smoothing() -> bool {
     FONT_SMOOTHING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[allow(unused)]
 pub(crate) fn font_name_with_fallbacks<'a>(name: &'a str, system: &'a str) -> &'a str {
     // Note: the "Zed Plex" fonts were deprecated as we are not allowed to use "Plex"
     // in a derived font name. They are essentially indistinguishable from IBM Plex/Lilex,

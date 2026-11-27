@@ -113,6 +113,20 @@ pub unsafe fn begin_file_drag(ns_view: *mut std::ffi::c_void, paths: &[PathBuf])
     }
 }
 
+/// Whether ⌥ is held right now. Unlike an app's cached modifier state, this
+/// is accurate during a drag that started in another app.
+pub fn option_key_down() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::{NSEvent, NSEventModifierFlags};
+        NSEvent::modifierFlags_class().contains(NSEventModifierFlags::Option)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Forces the dark Aqua appearance app-wide (so vibrancy renders dark). Must be
 /// called on the main thread; does nothing elsewhere.
 pub fn force_dark_appearance() {
@@ -247,6 +261,14 @@ mod imp {
     use objc2_app_kit::NSDraggingSource;
     use objc2_foundation::{NSObject, NSObjectProtocol};
 
+    std::thread_local! {
+        /// The source of the running drag session. AppKit doesn't document
+        /// that a session retains its source, so keep it alive until the
+        /// session ends.
+        static ACTIVE_SOURCE: std::cell::RefCell<Option<Retained<FileDragSource>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     objc2::define_class!(
         /// Drag source for files dragged out of Haven. The destination picks
         /// the operation (Finder moves within a volume and copies across).
@@ -274,6 +296,16 @@ mod imp {
                 } else {
                     NSDragOperation::Copy | NSDragOperation::Move | NSDragOperation::Generic
                 }
+            }
+
+            #[unsafe(method(draggingSession:endedAtPoint:operation:))]
+            fn ended(
+                &self,
+                _session: &objc2_app_kit::NSDraggingSession,
+                _point: NSPoint,
+                _operation: objc2_app_kit::NSDragOperation,
+            ) {
+                ACTIVE_SOURCE.with(|s| s.borrow_mut().take());
             }
         }
     );
@@ -340,9 +372,10 @@ mod imp {
                 &event,
                 ProtocolObject::from_ref(&*source),
             );
-            // Dropping back on the window that started the drag shouldn't
-            // animate the files "sliding back" when nothing accepted them.
+            // Like Finder: when nothing accepts the drop, the icons slide
+            // back to where the drag started.
             session.setAnimatesToStartingPositionsOnCancelOrFail(true);
+            ACTIVE_SOURCE.with(|s| *s.borrow_mut() = Some(source));
             true
         })
     }

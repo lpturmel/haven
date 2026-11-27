@@ -503,6 +503,22 @@ impl ExternalPaths {
     }
 }
 
+/// HAVEN PATCH: whether the source of the current (or last) external file
+/// drag allows moving its files. Apps that hand out their own data (editor
+/// file trees, attachment caches) usually allow only copying; Finder allows
+/// both. See vendor/gpui/HAVEN_PATCHES.md.
+static EXTERNAL_DRAG_ALLOWS_MOVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// See [`EXTERNAL_DRAG_ALLOWS_MOVE`].
+pub fn external_drag_allows_move() -> bool {
+    EXTERNAL_DRAG_ALLOWS_MOVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_external_drag_allows_move(allows: bool) {
+    EXTERNAL_DRAG_ALLOWS_MOVE.store(allows, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl Render for ExternalPaths {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         // the platform will render icons for the dragged files

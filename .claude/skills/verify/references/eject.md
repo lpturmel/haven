@@ -5,6 +5,21 @@ Code: `crates/haven-core/src/volumes.rs` (`eject`, `ejectable_volume_for`,
 (`crates/haven/src/workspace.rs`), the sidebar drive rows
 (`workspace_view.rs`) and the Start page drive cards (`views/start.rs`).
 
+## How eject decides (`eject_plan` → `eject`)
+
+- `diskutil info -plist` finds each volume's **physical** disk. For APFS
+  that's the container's physical store, not the synthesized container.
+- Volumes on the startup disk, and internal non-ejectable disks, are only
+  **unmounted** (toast: "“X” was unmounted"). Haven never asks diskutil to
+  eject an internal disk.
+- Otherwise the whole disk is ejected. If other volumes share that disk,
+  Haven asks first ("Eject “A” and the other volumes on its disk?", with an
+  "Eject All" button), and tabs on every affected volume go to the start
+  page.
+- "can be safely removed" appears only when the volume *and* every sibling
+  went away. A busy sibling gives "“B” on the same disk is still mounted:
+  it's in use by another app".
+
 ## Safety invariant (check it in the diff)
 
 `diskutil eject <path>` resolves any path to the whole disk that holds it.
@@ -57,6 +72,19 @@ no volume says "Nothing to eject here".
    `Couldn't eject “HavenEjectTest”: it's in use by another app`, with the
    drive still listed. Kill the `sleep` and eject again: it succeeds.
 6. Clean up: `hdiutil detach /Volumes/HavenEjectTest 2>/dev/null; rm -rf "$D"`.
+
+7. Multi-volume disk (scratch image only):
+   ```bash
+   hdiutil create -size 100m -layout GPTSPUD -fs JHFS+ -volname HavenMultiA "$D/m.dmg"
+   DEV=$(hdiutil attach "$D/m.dmg" | head -1 | awk '{print $1}')
+   diskutil partitionDisk "$DEV" 2 GPT JHFS+ HavenMultiA 45M JHFS+ HavenMultiB R
+   ```
+   Eject HavenMultiA from Haven: the confirmation names HavenMultiB, and
+   "Eject All" ejects both. Keep a file open on B and eject A: the red toast
+   says B is still mounted, never "safely removed".
+   `cargo test -p haven-core volumes` covers the plan logic headlessly
+   (`plans_whole_disk_ejects_with_siblings`,
+   `internal_and_boot_disk_volumes_are_only_unmounted`).
 
 Headless alternative when the screen is busy: step 2's outcome is covered
 by the ignored test plus the gpui tests. Capture the sidebar

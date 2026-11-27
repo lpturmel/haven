@@ -348,7 +348,7 @@ pub fn render_context_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> Optio
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .rounded(px(5.))
+                        .rounded(px(6.))
                         .text_size(px(13.))
                         .text_color(color)
                         .hover(|s| s.bg(t.accent).text_color(gpui::white()))
@@ -1048,7 +1048,7 @@ fn fuzzy_row(ws: &Workspace, row: usize, cx: &mut Context<Workspace>) -> AnyElem
             .rounded(px(6.))
             .text_size(px(13.))
             .when(row == f.selected, |d| d.bg(t.selection))
-            .hover(|s| s.bg(t.hover))
+            .when(row != f.selected, |d| d.hover(|s| s.bg(t.hover)))
             .on_click(cx.listener(move |ws, _, window, cx| {
                 reveal_found(ws, path.clone(), is_dir, window, cx)
             }))
@@ -1128,7 +1128,7 @@ pub fn render_overlay(
                         .gap(px(10.))
                         .rounded(px(6.))
                         .when(selected, |d| d.bg(t.selection))
-                        .hover(|s| s.bg(t.hover))
+                        .when(!selected, |d| d.hover(|s| s.bg(t.hover)))
                         .on_click(cx.listener(move |ws, _, window, cx| {
                             ws.overlay = None;
                             ws.dispatch_menu_action(action.boxed_clone(), window, cx)

@@ -250,6 +250,14 @@ fn toggle(list: &mut Vec<PathBuf>, path: &Path) {
 mod tests {
     use super::*;
     use crate::sort::SortKey;
+
+    #[test]
+    fn font_smoothing_defaults_on_even_for_old_state_files() {
+        assert!(AppState::default().font_smoothing);
+        // A state.json written before the setting existed.
+        let old: AppState = serde_json::from_str(r#"{"version":1,"show_hidden":true}"#).unwrap();
+        assert!(old.font_smoothing && old.show_hidden);
+    }
     use crate::tags::TagColor;
 
     #[test]

@@ -10,10 +10,25 @@ Rows that highlight on hover follow one recipe:
 | List rows | 26 | 4 + 6 cell padding (icon under the "Name" header) | 8 | 6 | `hover` |
 | Column rows | 24 | 8 | 8 | 6 | `hover` |
 | Palette, fuzzy, tag-editor rows | 28–32 | 10 | 10 | 6 | `hover` |
-| Small inline buttons (eject, unpin) | 20×20 | n/a | n/a | 4 | `active` |
+| Small inline buttons (sidebar and Start page eject, unpin) | 20×20 | n/a | n/a | 4 | `control_hover` (14%) |
+| Toolbar segments, tabs, menu items, completions | n/a | n/a | n/a | 6 | `hover` |
 
 Font sizes are whole pixels only (no `.5`). Every sidebar label starts at
-the same x, tags included.
+the same x, tags included, and long labels end in "…".
+
+Rules that a validator caught once, so check them on every change:
+- **Hover never replaces a "selected" or "on" fill.** In gpui a `.hover()`
+  refinement replaces the base `bg`, so guard it with `when(!selected, …)`,
+  or re-assert the fill inside the hover.
+- **Disabled controls don't hover.** No fill, default cursor.
+- **No 1px shifts.** Borders that come and go (active tab, cursor ring) are
+  always present and transparent when off.
+- **Fades apply to content, not to fills.** Hidden items fade their icon and
+  label, so their hover and selection fills match other rows.
+- **Grid labels** are at most two lines, laid out by `grid::label_lines`,
+  with the second ending in "…". Never use `line_clamp(2)` with a centred
+  ellipsis: gpui truncates it as one double-width line, so line 2
+  overflows.
 
 ## List columns (the narrow-window bug)
 

@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, App, Context, ExternalPaths, FontWeight, Global, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, Window, div,
+    AnyElement, App, Context, FontWeight, Global, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, relative,
 };
 use haven_core::recents::Recent;
@@ -16,7 +16,7 @@ use super::entry_icon_el;
 use crate::actions::EjectVolume;
 use crate::actions::NavigateTo;
 use crate::store::Store;
-use crate::tab::{DraggedFiles, Location, Tab};
+use crate::tab::{Location, Tab};
 use crate::theme::theme;
 use crate::ui::Ellipsis as _;
 use crate::ui::{icon, icon_button, tag_dot};
@@ -203,20 +203,20 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                         d.child(
                             div()
                                 .id(("eject-drive", i))
-                                .size(px(26.))
+                                .size(px(20.))
                                 .flex_none()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .rounded(px(6.))
+                                .rounded(px(4.))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(t.hover))
+                                .hover(|s| s.bg(t.control_hover))
                                 .tooltip(|_, cx| crate::ui::tooltip("Eject", cx))
                                 .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
                                     window.dispatch_action(Box::new(EjectVolume(m.clone())), cx);
                                 })
-                                .child(icon("eject").size(px(14.)).text_color(t.text_muted)),
+                                .child(icon("eject").size(px(13.)).text_color(t.text_muted)),
                         )
                     })
                     .into_any_element()
@@ -256,7 +256,11 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                         }
                     }),
                 )
-                .children(entry.as_ref().map(|e| entry_icon_el(e, 18., cx)))
+                // Reserve the icon slot while it loads, so names stay aligned.
+                .child(match entry.as_ref() {
+                    Some(e) => entry_icon_el(e, 18., cx),
+                    None => div().size(px(18.)).flex_none().into_any_element(),
+                })
                 .child(
                     div()
                         .flex_1()
@@ -321,9 +325,11 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
             div()
                 .id("start-pinned")
                 .rounded(px(8.))
-                .drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(t.hover))
-                .on_drop(cx.listener(|_, files: &DraggedFiles, _, cx| pin_all(&files.paths, cx)))
-                .on_drop(cx.listener(|_, ext: &ExternalPaths, _, cx| pin_all(ext.paths(), cx)))
+                .map(|d| {
+                    super::file_drop_target(d, t.hover, cx, |_, dropped, _, cx| {
+                        pin_all(&dropped.paths, cx)
+                    })
+                })
                 .child(section("pin", "Pinned", cx))
                 .child(if pinned_tiles.is_empty() {
                     div()

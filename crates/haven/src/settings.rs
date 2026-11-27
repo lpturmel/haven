@@ -113,17 +113,23 @@ impl Settings {
             f
         });
         let subs = vec![
-            cx.subscribe_in(&terminal, window, |_, field, ev, _, cx| {
-                if *ev == TextFieldEvent::Changed {
+            cx.subscribe_in(&terminal, window, |_, field, ev, window, cx| match ev {
+                TextFieldEvent::Changed => {
                     let v = field.read(cx).text().trim().to_string();
                     Store::update(cx, |s| s.terminal_app = v);
                 }
+                // The field takes Esc for itself: close the window as
+                // Esc does everywhere else in Settings.
+                TextFieldEvent::Cancel => window.remove_window(),
+                _ => {}
             }),
-            cx.subscribe_in(&editor, window, |_, field, ev, _, cx| {
-                if *ev == TextFieldEvent::Changed {
+            cx.subscribe_in(&editor, window, |_, field, ev, window, cx| match ev {
+                TextFieldEvent::Changed => {
                     let v = field.read(cx).text().trim().to_string();
                     Store::update(cx, |s| s.editor_command = v);
                 }
+                TextFieldEvent::Cancel => window.remove_window(),
+                _ => {}
             }),
             cx.observe_global::<Store>(|this, cx| {
                 let on = Store::get(cx).font_smoothing;
@@ -236,7 +242,7 @@ fn view_picker(current: ViewMode, cx: &mut Context<Settings>) -> impl IntoElemen
                 .gap(px(5.))
                 .h(px(24.))
                 .px(px(10.))
-                .rounded(px(5.))
+                .rounded(px(6.))
                 .text_size(px(12.))
                 .cursor_pointer()
                 .when(active, |d| d.bg(t.active).text_color(t.text))
@@ -280,7 +286,7 @@ fn stepper(value: f32, cx: &mut Context<Settings>) -> impl IntoElement {
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(5.))
+            .rounded(px(6.))
             .when(enabled, |d| {
                 d.cursor_pointer()
                     .hover(|s| s.bg(t.hover))
@@ -503,5 +509,25 @@ mod tests {
         // Odd persisted values snap onto the grid first.
         assert_eq!(step_grid_icon(70., 1), 80.);
         assert_eq!(step_grid_icon(500., 0), GRID_ICON_MAX);
+    }
+
+    #[gpui::test]
+    async fn font_smoothing_switch_applies_live(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::store::init_test_env();
+            cx.set_global(crate::theme::Theme::dark());
+            Store::init(cx);
+            Store::update(cx, |s| s.font_smoothing = true);
+            crate::apply_font_smoothing(cx);
+        });
+        assert!(gpui::font_smoothing());
+        let (_view, cx) = cx.add_window_view(Settings::new);
+        // What the switch does: write the store; the window applies it.
+        cx.update(|_, cx| Store::update(cx, |s| s.font_smoothing = false));
+        cx.run_until_parked();
+        assert!(!gpui::font_smoothing());
+        cx.update(|_, cx| Store::update(cx, |s| s.font_smoothing = true));
+        cx.run_until_parked();
+        assert!(gpui::font_smoothing());
     }
 }

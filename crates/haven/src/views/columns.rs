@@ -51,7 +51,7 @@ pub fn render(tab: &mut Tab, window: &mut Window, cx: &mut Context<Tab>) -> AnyE
     )
     .track_scroll(tab.scroll.clone())
     .size_full()
-    .px(px(5.))
+    .px(px(6.))
     .py(px(4.));
     columns.push(
         column_frame("col-cur", cx)
@@ -73,7 +73,7 @@ pub fn render(tab: &mut Tab, window: &mut Window, cx: &mut Context<Tab>) -> AnyE
                     d,
                     gpui::transparent_black(),
                     cx,
-                    move |tab, paths, window, cx| tab.drop_on(dest.clone(), paths, window, cx),
+                    move |tab, dropped, _, cx| tab.drop_on(dest.clone(), dropped, cx),
                 )
             })
             .child(current)
@@ -153,7 +153,7 @@ fn static_column(
                 }),
             )
             .size_full()
-            .px(px(5.))
+            .px(px(6.))
             .py(px(4.)),
         )
         .into_any_element()
@@ -244,9 +244,9 @@ fn current_row(tab: &mut Tab, ix: usize, cx: &mut Context<Tab>) -> AnyElement {
         .on_click(cx.listener(move |tab, _, _, cx| tab.click_item(ix, cx)))
         .when(e.is_navigable(), |d| {
             let dest = e.path.clone();
-            file_drop_target(d, t.selection, cx, move |tab, paths, window, cx| {
-                if !paths.contains(&dest) {
-                    tab.drop_on(dest.clone(), paths, window, cx);
+            file_drop_target(d, t.selection, cx, move |tab, dropped, _, cx| {
+                if !dropped.paths.contains(&dest) {
+                    tab.drop_on(dest.clone(), dropped, cx);
                 }
             })
         })

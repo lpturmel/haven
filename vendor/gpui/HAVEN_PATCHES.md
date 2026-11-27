@@ -36,13 +36,27 @@ dilation. Emoji are unchanged.
 
 ## 2. Synthetic drag stops when no button is held
 
-`src/platform/mac/window.rs`, `handle_view_event`
+`src/platform/mac/window.rs`, `handle_view_event` and `synthetic_drag`
 
 While the mouse button is held, gpui replays the last drag event every 16ms
 until a mouse-up. When Haven hands a file drag to AppKit (dragging files out
 of the window, see `crates/haven/src/native_drag.rs`), the native drag session
-swallows that mouse-up, and the replay would run forever. The loop now also
-stops on any mouse move that has no button pressed.
+swallows that mouse-up, and the replay would run forever. The loop now stops
+on any mouse move with no button pressed, and on its next tick once
+`NSEvent.pressedMouseButtons` is 0. The second check covers drops that
+activate another app, where the cursor never comes back over Haven.
+
+## 2b. External drags: source operations and an honest cursor badge
+
+`src/interactive.rs`, `src/platform/mac/window.rs` (`drag_operation`)
+
+Stock gpui answers every external file drag with "copy" and doesn't say what
+the source allows. The patch records whether the drag source allows moving
+(`draggingSourceOperationMask` & Move), readable through
+`gpui::external_drag_allows_move()`. It also answers Move, with no badge,
+when the source allows it and ⌥ isn't held, and Copy ("+") otherwise. Haven
+copies from apps that only lend their files (an editor's file tree, a mail
+attachment) and keeps Finder's rules for Finder drags.
 
 ## 3. Warning fix
 

@@ -29,6 +29,9 @@ pub struct Theme {
     pub selection: Hsla,
     pub selection_inactive: Hsla,
     pub hover: Hsla,
+    /// Small inline buttons inside a hoverable row or card (eject, unpin):
+    /// stronger than the row's own hover so the button stands out.
+    pub control_hover: Hsla,
     pub active: Hsla,
     pub danger: Hsla,
     pub success: Hsla,
@@ -66,6 +69,7 @@ impl Theme {
             selection: rgba(0x0a84ff40).into(),
             selection_inactive: hsla(0., 0., 1., 0.09),
             hover: hsla(0., 0., 1., 0.05),
+            control_hover: hsla(0., 0., 1., 0.14),
             active: hsla(0., 0., 1., 0.09),
             danger: rgb(0xff453a).into(),
             success: rgb(0x32d74b).into(),
