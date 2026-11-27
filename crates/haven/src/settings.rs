@@ -49,13 +49,25 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
+/// Whether `handle`'s window still exists. Unlike `handle.update(..)`, this
+/// holds while that window is the one dispatching the current event: gpui
+/// checks a window out of its map for the duration, so `update` on it fails.
+fn is_open(handle: WindowHandle<Settings>, cx: &App) -> bool {
+    cx.windows()
+        .iter()
+        .any(|w| w.window_id() == handle.window_id())
+}
+
 /// Opens the Settings window, or brings the open one to the front.
 pub fn open(cx: &mut App) {
     if let Some(handle) = cx.try_global::<SettingsWindow>().and_then(|w| w.0)
-        && handle
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
+        && is_open(handle, cx)
     {
+        // ⌘, pressed inside Settings runs while gpui has that window checked
+        // out: activate it once the current dispatch is over.
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+        });
         return;
     }
     let bounds = Bounds::centered(None, size(px(560.), px(560.)), cx);
@@ -140,7 +152,14 @@ impl Settings {
                 }
                 cx.notify()
             }),
-            cx.on_release(|_, cx| cx.set_global(SettingsWindow(None))),
+            // Forget the window once it's gone, but never a newer one that
+            // is still open (this release can land after it was opened).
+            cx.on_release(|_, cx| {
+                let current = cx.try_global::<SettingsWindow>().and_then(|w| w.0);
+                if current.is_none_or(|h| !is_open(h, cx)) {
+                    cx.set_global(SettingsWindow(None));
+                }
+            }),
         ];
         Settings {
             smoothing: state.font_smoothing,
@@ -529,5 +548,57 @@ mod tests {
         cx.update(|_, cx| Store::update(cx, |s| s.font_smoothing = true));
         cx.run_until_parked();
         assert!(gpui::font_smoothing());
+    }
+
+    #[gpui::test]
+    async fn open_settings_keeps_a_single_window(cx: &mut gpui::TestAppContext) {
+        use crate::actions::OpenSettings;
+        cx.update(|cx| {
+            crate::store::init_test_env();
+            cx.set_global(crate::theme::Theme::dark());
+            Store::init(cx);
+            // As in main.rs: ⌘, (and the menu item) run this global handler.
+            cx.on_action(|_: &OpenSettings, cx| open(cx));
+        });
+        let windows = |cx: &mut gpui::TestAppContext| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|w| w.downcast::<Settings>())
+                .collect::<Vec<_>>()
+        };
+        let current = |cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| cx.try_global::<SettingsWindow>().and_then(|w| w.0))
+        };
+
+        cx.update(open);
+        cx.run_until_parked();
+        let first = windows(cx);
+        assert_eq!(first.len(), 1);
+        assert_eq!(current(cx), Some(first[0]));
+
+        // ⌘, pressed inside Settings: the action runs while gpui has that
+        // window checked out, which used to open a second one.
+        cx.dispatch_action(first[0].into(), OpenSettings);
+        assert_eq!(windows(cx), first);
+
+        // From elsewhere (main window, menu bar) it's reused too.
+        cx.update(open);
+        cx.run_until_parked();
+        assert_eq!(windows(cx), first);
+        assert_eq!(current(cx), Some(first[0]));
+
+        // Once closed, the next ⌘, opens a fresh window.
+        first[0]
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(windows(cx).is_empty());
+        assert_eq!(current(cx), None);
+        cx.update(open);
+        cx.run_until_parked();
+        let second = windows(cx);
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0], first[0]);
+        assert_eq!(current(cx), Some(second[0]));
     }
 }
