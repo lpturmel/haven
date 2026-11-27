@@ -18,7 +18,7 @@ use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use crate::actions::*;
 use crate::store::Store;
 use crate::text_field::{TextField, TextFieldEvent};
-use crate::theme::theme;
+use crate::theme::{Theme, theme};
 use crate::ui::Ellipsis as _;
 use crate::ui::{icon, kbd, tag_dot, text_button};
 use crate::views::start::start_data;
@@ -268,6 +268,17 @@ pub fn sort_menu(ws: &Workspace, cx: &App) -> Vec<MenuEntry> {
     items
 }
 
+/// The ring around a context-menu tag circle, and its colour under the
+/// pointer. A tag that's on keeps its ring: hover never replaces an "on"
+/// state.
+fn tag_ring(on: bool, t: &Theme) -> (Hsla, Option<Hsla>) {
+    if on {
+        (t.text, None)
+    } else {
+        (gpui::transparent_black(), Some(t.text_muted))
+    }
+}
+
 pub fn render_context_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement> {
     let menu = ws.context_menu.as_ref()?;
     let t = theme(cx).clone();
@@ -301,6 +312,7 @@ pub fn render_context_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> Optio
                     .children(tags.iter().enumerate().map(|(j, (name, color, on))| {
                         let name = name.clone();
                         let c = t.tag(*color);
+                        let (ring, hover_ring) = tag_ring(*on, &t);
                         div()
                             .id(("menu-tag", j))
                             .size(px(18.))
@@ -310,15 +322,11 @@ pub fn render_context_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> Optio
                             .justify_center()
                             .bg(if *color == TagColor::None { t.hover } else { c })
                             .border_1()
-                            .border_color(if *on {
-                                t.text
-                            } else {
-                                gpui::transparent_black()
-                            })
+                            .border_color(ring)
                             .when(*on, |d| {
                                 d.child(icon("check").size(px(11.)).text_color(gpui::white()))
                             })
-                            .hover(|s| s.border_color(t.text_muted))
+                            .when_some(hover_ring, |d, h| d.hover(move |s| s.border_color(h)))
                             .on_click(cx.listener(move |ws, _, window, cx| {
                                 ws.dispatch_menu_action(
                                     Box::new(ToggleTag(name.clone())),
@@ -339,6 +347,10 @@ pub fn render_context_menu(ws: &Workspace, cx: &mut Context<Workspace>) -> Optio
             } => {
                 let action = action.boxed_clone();
                 let color = if *danger { t.danger } else { t.text };
+                // Deliberately not the overlay-row recipe (10px inset,
+                // `hover` fill): this matches a native macOS menu, with a
+                // 4 + 8 inset that the header, tag row and separator share,
+                // and the accent highlight with white text.
                 rows.push(
                     div()
                         .id(("menu-item", i))
@@ -1705,4 +1717,20 @@ pub fn render_overlay(
             .child(content)
             .into_any_element(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_on_tag_keeps_its_ring_under_the_pointer() {
+        let t = Theme::dark();
+        assert_eq!(tag_ring(true, &t), (t.text, None));
+        // Off: no ring, and hovering shows a muted one.
+        assert_eq!(
+            tag_ring(false, &t),
+            (gpui::transparent_black(), Some(t.text_muted))
+        );
+    }
 }

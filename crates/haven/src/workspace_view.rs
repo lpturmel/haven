@@ -18,7 +18,7 @@ use crate::store::Store;
 use crate::tab::{DraggedFiles, Location};
 use crate::theme::{UI_FONT, theme};
 use crate::ui::Ellipsis as _;
-use crate::ui::{icon, icon_button, section_label, tag_dot};
+use crate::ui::{icon, icon_button, inline_button, section_label, tag_dot};
 use crate::views::file_drop_target;
 use crate::views::start::start_data;
 use crate::workspace::Workspace;
@@ -253,16 +253,7 @@ impl Workspace {
                     }),
                 )
                 .child(
-                    div()
-                        .id(SharedString::from(format!("unpin-{i}")))
-                        .size(px(20.))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(t.control_hover))
+                    inline_button(SharedString::from(format!("unpin-{i}")), cx)
                         .tooltip(|_, cx| crate::ui::tooltip("Remove from Sidebar", cx))
                         .invisible()
                         .group_hover("pinrow", |s| s.visible())
@@ -352,16 +343,7 @@ impl Workspace {
                     );
                 row.when(ejectable, |d| {
                     d.child(
-                        div()
-                            .id(SharedString::from(format!("eject-{i}")))
-                            .size(px(20.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(t.control_hover))
+                        inline_button(SharedString::from(format!("eject-{i}")), cx)
                             .tooltip(|_, cx| crate::ui::tooltip("Eject", cx))
                             .on_click(cx.listener(move |ws, _, _, cx| {
                                 cx.stop_propagation();
@@ -505,7 +487,10 @@ impl Workspace {
                     .min_w(px(100.))
                     .max_w(px(200.))
                     .flex_1()
-                    .px(px(10.))
+                    // 6 on the right leaves the title as wide as it was
+                    // with the old 16px close button (now 20px).
+                    .pl(px(10.))
+                    .pr(px(6.))
                     .flex()
                     .items_center()
                     .gap(px(7.))
@@ -549,16 +534,9 @@ impl Workspace {
                     }))
                     .child(div().flex_1().min_w_0().ellipsis().child(title))
                     .child(
-                        div()
-                            .id(("tab-close", i))
-                            .size(px(16.))
-                            .rounded(px(4.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
+                        inline_button(("tab-close", i), cx)
                             .invisible()
                             .group_hover("tab", |s| s.visible())
-                            .hover(|s| s.bg(t.active))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(
                                 cx.listener(move |ws, _, window, cx| ws.close_tab(i, window, cx)),
