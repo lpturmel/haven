@@ -24,9 +24,12 @@
 # Everything interactive (path bar, menus, tags, undo…) still needs a person or
 # an agent with screen control; see the checklist in AGENTS.md.
 #
-# Refuses to run while another Haven instance is open: instances share the
-# bundle id `dev.haven.app`, so automation would attach to the wrong (possibly
-# stale) build. Quit it first.
+# Safe to run next to other Haven instances (an installed /Applications copy,
+# builds from other worktrees): every build shares the bundle id
+# `dev.haven.app`, so this script never addresses an app by bundle id. It finds
+# its instance by this checkout's bundle path and pid, captures that pid's
+# window, and quits it by pid. It only refuses to run if this checkout's own
+# bundle is already running (a leftover from an earlier run).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,9 +40,10 @@ HELPER="${ROOT_DIR}/scripts/haven-window.swift"
 # for 4.5:1 contrast; keep headroom for the dimmer section labels.
 SIDEBAR_MAX_LUMA="${SIDEBAR_MAX_LUMA:-0.12}"
 
-if pgrep -f "/Haven.app/Contents/MacOS/haven" >/dev/null; then
-    echo "error: Haven is already running; quit it first (instances share dev.haven.app)." >&2
-    pgrep -fl "/Haven.app/Contents/MacOS/haven" >&2
+EXE="${APP}/Contents/MacOS/haven"
+if pgrep -f "${EXE}" >/dev/null; then
+    echo "error: this checkout's Haven.app is already running; quit it first:" >&2
+    pgrep -fl "${EXE}" >&2
     exit 2
 fi
 
@@ -59,7 +63,18 @@ HEIC="$(find "/System/Library/Desktop Pictures" -maxdepth 1 -name '*.heic' 2>/de
 [[ -n "${HEIC}" ]] && cp "${HEIC}" "${FIXTURE}/photo.heic"
 
 STATE="$(mktemp -d /tmp/haven-visual-state.XXXXXX)"
-trap 'osascript -e "quit app id \"dev.haven.app\"" >/dev/null 2>&1 || true' EXIT
+# Stop only the instance(s) launched from this checkout's bundle, never another
+# Haven (quitting by bundle id would hit whichever instance came first).
+quit_ours() {
+    local pid="$1"
+    kill -TERM "${pid}" 2>/dev/null || return 0
+    for _ in $(seq 1 50); do
+        kill -0 "${pid}" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    kill -KILL "${pid}" 2>/dev/null || true
+}
+trap 'for p in $(pgrep -f "${EXE}"); do quit_ours "${p}"; done' EXIT
 
 capture() {
     local name="$1" view="$2"
@@ -69,7 +84,7 @@ capture() {
     open -n --env "HAVEN_STATE_DIR=${STATE}" "${APP}" --args "$@"
     local pid=""
     for _ in $(seq 1 50); do
-        pid="$(pgrep -n -f "${APP}/Contents/MacOS/haven" || true)"
+        pid="$(pgrep -n -f "${EXE}" || true)"
         [[ -n "${pid}" ]] && break
         sleep 0.1
     done
@@ -86,14 +101,12 @@ capture() {
             screencapture -x -o -R "${bounds}" "${OUT_DIR}/${name}.png"
             break
         fi
-        open -a "${APP}" # bring it back to the front and try again
+        # Bring it back to the front and try again. LaunchServices resolves
+        # the path to this bundle's instance, not another dev.haven.app.
+        open -a "${APP}"
         sleep 1
     done
-    osascript -e 'quit app id "dev.haven.app"' >/dev/null 2>&1 || true
-    for _ in $(seq 1 50); do
-        kill -0 "${pid}" 2>/dev/null || break
-        sleep 0.1
-    done
+    quit_ours "${pid}"
     echo "${bounds}"
 }
 

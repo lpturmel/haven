@@ -6,6 +6,7 @@
 //
 //   swift scripts/haven-window.swift occluded <window-id>
 //       Exits 0 if another app's window above it overlaps it (it is covered), 1 if not.
+//       When covered, names the covering app and pid on stderr.
 //
 //   swift scripts/haven-window.swift luma <png> <x> <y> <w> <h>
 //       Prints the mean WCAG relative luminance (0...1) of a region of <png>, where the
@@ -58,7 +59,7 @@ func occluded(windowID: Int) -> Bool {
         "Window Server", "Dock", "SystemUIServer", "Control Center", "WindowManager",
         "TextInputMenuAgent",
     ]
-    return above.contains { w in
+    let cover = above.first { w in
         guard (w[kCGWindowOwnerPID as String] as? Int32) != myPid,
             !furniture.contains(w[kCGWindowOwnerName as String] as? String ?? ""),
             // 24/25: the menu bar and its status items (owned by many apps).
@@ -73,6 +74,13 @@ func occluded(windowID: Int) -> Bool {
         else { return false }
         return r.intersects(myRect)
     }
+    if let cover {
+        // Say who covered it, so a skipped capture can be explained.
+        let owner = cover[kCGWindowOwnerName as String] as? String ?? "?"
+        let pid = cover[kCGWindowOwnerPID as String] as? Int32 ?? 0
+        FileHandle.standardError.write("covered by \(owner) (pid \(pid))\n".data(using: .utf8)!)
+    }
+    return cover != nil
 }
 
 func linear(_ c: Double) -> Double {
