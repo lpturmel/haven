@@ -27,6 +27,21 @@ cp -R target/bundle/Haven.app /Applications/
 scripts/haven ~/some/folder         # CLI shim (put it on your PATH)
 ```
 
+The bundle uses `assets/AppIcon.icns` for Finder and the Dock. The 1024×1024
+master is `assets/AppIcon.png`. It is full-bleed, opaque square artwork: macOS
+applies the rounded squircle mask itself. Don't bake in rounded corners or a
+transparent margin, or macOS 26+ shrinks the icon onto a grey plate. Regenerate
+the `.icns` from the master when changing the icon:
+
+```bash
+mkdir AppIcon.iconset
+for s in 16 32 128 256 512; do
+  sips -z $s $s assets/AppIcon.png --out AppIcon.iconset/icon_${s}x${s}.png
+  sips -z $((s*2)) $((s*2)) assets/AppIcon.png --out AppIcon.iconset/icon_${s}x${s}@2x.png
+done
+iconutil -c icns -o assets/AppIcon.icns AppIcon.iconset && rm -r AppIcon.iconset
+```
+
 ## Test
 
 ```bash

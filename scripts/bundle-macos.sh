@@ -20,6 +20,7 @@ rm -rf "${BUNDLE_DIR}"
 mkdir -p "${MACOS_DIR}" "${BUNDLE_DIR}/Contents/Resources"
 cp "${ROOT_DIR}/target/${PROFILE}/haven" "${MACOS_DIR}/haven"
 cp "${ROOT_DIR}/assets/Info.plist.template" "${BUNDLE_DIR}/Contents/Info.plist"
+cp "${ROOT_DIR}/assets/AppIcon.icns" "${BUNDLE_DIR}/Contents/Resources/AppIcon.icns"
 chmod +x "${MACOS_DIR}/haven"
 
 if command -v codesign >/dev/null 2>&1; then
