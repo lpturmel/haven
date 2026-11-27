@@ -51,17 +51,29 @@ pub fn bind_keys(cx: &mut App) {
 
 /// Opens the Settings window, or brings the open one to the front.
 pub fn open(cx: &mut App) {
+    // Check that the window still exists without updating it. When ⌘, is
+    // pressed inside Settings, the action runs during that window's own
+    // dispatch, and gpui has the window checked out, so `handle.update` fails
+    // even though the window is open. `cx.windows()` still lists it. Activate
+    // it once the dispatch has finished.
     if let Some(handle) = cx.try_global::<SettingsWindow>().and_then(|w| w.0)
-        && handle
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
+        && cx
+            .windows()
+            .iter()
+            .any(|w| w.window_id() == handle.window_id())
     {
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+        });
         return;
     }
-    let bounds = Bounds::centered(None, size(px(560.), px(560.)), cx);
+    // Same display as the main window when `HAVEN_DISPLAY` picks one.
+    let display = crate::target_display(cx);
+    let bounds = Bounds::centered(display, size(px(560.), px(560.)), cx);
     let handle = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            display_id: display,
             titlebar: Some(TitlebarOptions {
                 title: Some("Settings".into()),
                 appears_transparent: true,
@@ -164,8 +176,15 @@ fn row(
         .justify_between()
         .gap(px(16.))
         .min_h(px(36.))
+        // Rows with a hint line are taller than `min_h`: keep them off their
+        // neighbours.
+        .py(px(6.))
         .child(
+            // The label column gives way (its hint wraps) so the control
+            // always fits inside the card.
             div()
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
@@ -174,7 +193,7 @@ fn row(
                     d.child(div().text_size(px(12.)).text_color(t.text_faint).child(h))
                 }),
         )
-        .child(control)
+        .child(div().flex_none().child(control))
 }
 
 fn group(t: &Theme, title: &'static str, rows: Vec<gpui::Div>) -> gpui::Div {
@@ -483,15 +502,22 @@ impl Render for Settings {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px(px(20.))
-                    .py(px(16.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(18.))
-                    .child(general)
-                    .child(appearance)
-                    .child(tools)
-                    .child(viewer),
+                    .child(
+                        // Padding on an inner box, not on the scroll
+                        // container itself, so the bottom padding counts
+                        // toward the scrollable height and the last card
+                        // doesn't sit flush against the window edge.
+                        div()
+                            .px(px(20.))
+                            .py(px(16.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(18.))
+                            .child(general)
+                            .child(appearance)
+                            .child(tools)
+                            .child(viewer),
+                    ),
             )
     }
 }
@@ -509,6 +535,65 @@ mod tests {
         // Odd persisted values snap onto the grid first.
         assert_eq!(step_grid_icon(70., 1), 80.);
         assert_eq!(step_grid_icon(500., 0), GRID_ICON_MAX);
+    }
+
+    fn init_settings_app(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::store::init_test_env();
+            cx.set_global(crate::theme::Theme::dark());
+            Store::init(cx);
+            cx.on_action(|_: &crate::actions::OpenSettings, cx| open(cx));
+        });
+    }
+
+    fn settings_handle(cx: &mut gpui::TestAppContext) -> WindowHandle<Settings> {
+        cx.update(|cx| cx.try_global::<SettingsWindow>().and_then(|w| w.0))
+            .expect("Settings window is open")
+    }
+
+    /// ⌘, pressed while Settings itself is the key window must not open a
+    /// second Settings window. The action runs inside that window's own
+    /// dispatch, while gpui has the window checked out.
+    #[gpui::test]
+    async fn open_settings_from_inside_settings_keeps_one_window(cx: &mut gpui::TestAppContext) {
+        init_settings_app(cx);
+        cx.update(open);
+        cx.run_until_parked();
+        let first = settings_handle(cx);
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+
+        first
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(crate::actions::OpenSettings), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            1,
+            "a second Settings window opened"
+        );
+        assert_eq!(settings_handle(cx).window_id(), first.window_id());
+    }
+
+    /// Once Settings is closed, ⌘, opens a fresh one (and only one).
+    #[gpui::test]
+    async fn open_settings_after_close_opens_a_new_window(cx: &mut gpui::TestAppContext) {
+        init_settings_app(cx);
+        cx.update(open);
+        cx.run_until_parked();
+        let first = settings_handle(cx);
+        first
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| cx.windows().len()), 0);
+
+        cx.update(open);
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+        assert_ne!(settings_handle(cx).window_id(), first.window_id());
     }
 
     #[gpui::test]

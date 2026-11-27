@@ -1236,7 +1236,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &MakeDefaultViewer, window, cx| {
                 ws.overlay = Some(Overlay::Confirm {
                     title: "Make Haven the default file viewer?".into(),
-                    body: "Sets NSFileViewer and the folder handler so “Reveal in Finder” and opened folders go to Haven. You can undo this with “Restore Finder as Default File Viewer”.".into(),
+                    body: "Sets NSFileViewer and the folder handler so “Reveal in Finder” and opened folders go to Haven. You can undo this with Haven ▸ Restore Finder as Default, or “Use Finder” in Settings.".into(),
                     confirm: "Make Default".into(),
                     action: Box::new(ConfirmDefaultViewer(true)),
                 });

@@ -246,6 +246,11 @@ fn main() {
         // reopen events and opened URLs then create a fresh window.
         let handle = std::rc::Rc::new(std::cell::Cell::new(open_window(cx, args.clone())));
         cx.set_global(settings::MainWindow(handle.get()));
+        // `HAVEN_OPEN_SETTINGS=1` opens Settings at launch, so validation runs
+        // can capture it without sending ⌘, to a background window.
+        if std::env::var_os("HAVEN_OPEN_SETTINGS").is_some_and(|v| v == "1") {
+            settings::open(cx);
+        }
 
         // Folders/files opened via Finder, `open -a Haven`, or NSFileViewer.
         let urls_handle = handle.clone();

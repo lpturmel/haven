@@ -83,6 +83,8 @@ Dev env vars:
   its captures show a stale first frame (an endless "Loading…" is the tell).
 - `HAVEN_WINDOW_SIZE=<w>x<h>`: initial size in points (minimum 900×560).
 - `HAVEN_FONT_SMOOTHING=0|1`: overrides the Settings switch.
+- `HAVEN_OPEN_SETTINGS=1`: opens Settings at launch (on the `HAVEN_DISPLAY`
+  screen), for captures without sending ⌘, to a background window.
 
 `scripts/visual-check.sh` (required, must exit 0) finds, captures and quits
 its own instance by bundle path and PID, so it runs next to other Havens.
