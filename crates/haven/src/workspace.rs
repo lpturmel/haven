@@ -68,6 +68,11 @@ pub struct Workspace {
     /// flips them from another window.
     seen_show_hidden: bool,
     seen_preview_visible: bool,
+    /// Room the path bar's crumbs get, measured each frame (0 until the
+    /// first frame); decides which leading crumbs collapse into "…".
+    pub crumbs_width: f32,
+    /// Which leading crumbs the last frame collapsed into "…".
+    pub crumbs_hidden: std::ops::Range<usize>,
     watcher: Option<DirWatcher>,
     overlay_subs: Vec<Subscription>,
     /// Dialogs that arrived from background work (a transfer's conflict
@@ -195,6 +200,8 @@ impl Workspace {
             ejecting: HashSet::new(),
             seen_show_hidden: Store::get(cx).show_hidden,
             seen_preview_visible: Store::get(cx).preview_visible,
+            crumbs_width: 0.,
+            crumbs_hidden: 0..0,
             watcher,
             overlay_subs: Vec::new(),
             queued_overlays: Default::default(),
@@ -1620,7 +1627,7 @@ pub fn refresh_pins(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, VisualTestContext, px};
 
     fn init(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1932,6 +1939,60 @@ mod tests {
             let _ = window.draw(cx);
         });
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn path_bar_collapses_leading_crumbs_and_keeps_the_current_folder(
+        cx: &mut TestAppContext,
+    ) {
+        init(cx);
+        let root = fixture();
+        let deep = root.join("projects/haven/a-folder-with-a-rather-long-name/and-one-more-level");
+        std::fs::create_dir_all(&deep).unwrap();
+        let (ws, cx) = open(cx, Location::Dir(deep.clone()));
+        let hidden = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            ws.read_with(cx, |ws, _| ws.crumbs_hidden.clone())
+        };
+        let fits = |cx: &mut VisualTestContext| {
+            let bar = cx.debug_bounds("crumbs").expect("crumbs drawn");
+            let last = cx.debug_bounds("crumb-last").expect("current folder drawn");
+            assert!(
+                last.size.width > px(40.),
+                "current folder squeezed: {last:?}"
+            );
+            assert!(
+                last.right() <= bar.right() + px(0.5),
+                "current folder clipped: {last:?} in {bar:?}"
+            );
+        };
+
+        // Wide: the whole path shows, no "…".
+        cx.simulate_resize(gpui::size(px(3000.), px(800.)));
+        draw(cx);
+        draw(cx);
+        assert!(ws.read_with(cx, |ws, _| ws.crumbs_width) > 0.);
+        assert!(hidden(&ws, cx).is_empty());
+        fits(cx);
+
+        // The bug: at 900pt the crumbs were clipped mid-word and the current
+        // folder fell off the end. Now leading crumbs collapse into "…".
+        cx.simulate_resize(gpui::size(px(900.), px(560.)));
+        draw(cx);
+        draw(cx);
+        assert!(!hidden(&ws, cx).is_empty(), "leading crumbs collapse");
+        // (gpui keeps stale debug bounds across frames, so this is only
+        // meaningful while "…" is drawn.)
+        let more = cx.debug_bounds("crumb-more").unwrap();
+        let last = cx.debug_bounds("crumb-last").unwrap();
+        assert!(more.right() <= last.left());
+        fits(cx);
+
+        // Widening again brings them back.
+        cx.simulate_resize(gpui::size(px(3000.), px(800.)));
+        draw(cx);
+        draw(cx);
+        assert!(hidden(&ws, cx).is_empty());
+        fits(cx);
     }
 
     #[gpui::test]
