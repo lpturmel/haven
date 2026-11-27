@@ -70,6 +70,10 @@ pub struct Workspace {
     seen_preview_visible: bool,
     watcher: Option<DirWatcher>,
     overlay_subs: Vec<Subscription>,
+    /// Dialogs that arrived from background work (a transfer's conflict
+    /// check) while another dialog or the context menu was open. They show
+    /// in order once nothing is open, never replacing what the user sees.
+    queued_overlays: std::collections::VecDeque<Overlay>,
     _subs: Vec<Subscription>,
 }
 
@@ -193,6 +197,7 @@ impl Workspace {
             seen_preview_visible: Store::get(cx).preview_visible,
             watcher,
             overlay_subs: Vec::new(),
+            queued_overlays: Default::default(),
             _subs: Vec::new(),
         };
         let initial = if initial.is_empty() {
@@ -886,25 +891,94 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.check_and_transfer(kind, sources, dest, false, window, cx);
+    }
+
+    /// Checks a transfer off the UI thread, then runs it or asks about
+    /// conflicts. `restore_cut`: the sources came from a cut that `paste`
+    /// took off the clipboard; it goes back there when nothing runs yet (a
+    /// no-op, or a conflict dialog the user may cancel).
+    fn check_and_transfer(
+        &mut self,
+        kind: OpKind,
+        sources: Vec<PathBuf>,
+        dest: PathBuf,
+        restore_cut: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if sources.is_empty() {
             return;
         }
-        if kind == OpKind::Move && sources.iter().all(|s| s.parent() == Some(dest.as_path())) {
+        // Both checks touch the filesystem, so they run off the UI thread.
+        // They compare identities, so a move into the folder the items are
+        // already in is a no-op (and an item is never "in conflict" with
+        // itself) however either path is spelled.
+        cx.spawn_in(window, async move |this, cx| {
+            let check = {
+                let (sources, dest) = (sources.clone(), dest.clone());
+                cx.background_executor()
+                    .spawn(async move {
+                        if kind == OpKind::Move && ops::already_in(&sources, &dest) {
+                            None
+                        } else {
+                            Some(ops::conflicts(&sources, &dest).len())
+                        }
+                    })
+                    .await
+            };
+            let _ = this.update_in(cx, |ws, window, cx| {
+                let runs = check == Some(0);
+                if restore_cut && !runs && ws.clipboard.is_none() {
+                    ws.clipboard = Some((sources.clone(), true));
+                }
+                match check {
+                    None => {}
+                    Some(0) => ws.run_transfer(kind, sources, dest, Conflict::KeepBoth, cx),
+                    Some(count) => ws.show_overlay_when_free(
+                        Overlay::Conflict {
+                            kind,
+                            sources,
+                            dest,
+                            count,
+                        },
+                        window,
+                        cx,
+                    ),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Shows a dialog produced by background work, or queues it while a
+    /// dialog or the context menu is open, so it never replaces what the
+    /// user is looking at (see `show_queued_overlay`).
+    fn show_overlay_when_free(
+        &mut self,
+        overlay: Overlay,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.queued_overlays.push_back(overlay);
+        self.show_queued_overlay(window, cx);
+    }
+
+    pub(crate) fn has_queued_overlay(&self) -> bool {
+        !self.queued_overlays.is_empty()
+    }
+
+    /// Shows the next queued dialog once no dialog or context menu is open.
+    /// Called on every render, so it catches every way a dialog closes.
+    pub(crate) fn show_queued_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay.is_some() || self.context_menu.is_some() {
             return;
         }
-        let conflicts = ops::conflicts(&sources, &dest);
-        if !conflicts.is_empty() {
-            self.overlay = Some(Overlay::Conflict {
-                kind,
-                sources,
-                dest,
-                count: conflicts.len(),
-            });
+        if let Some(next) = self.queued_overlays.pop_front() {
+            self.overlay = Some(next);
             window.focus(&self.focus);
             cx.notify();
-            return;
         }
-        self.run_transfer(kind, sources, dest, Conflict::KeepBoth, cx);
     }
 
     pub fn run_transfer(
@@ -1126,12 +1200,18 @@ impl Workspace {
         let Some(dest) = self.active_tab().read(cx).dir().map(Path::to_path_buf) else {
             return;
         };
-        // A cut is consumed when the move actually runs (see run_transfer),
-        // so cancelling the conflict dialog keeps it for another try.
-        self.start_transfer(
+        // A cut is taken off the clipboard now, so a second ⌘V before the
+        // background check returns can't move it again. It goes back if
+        // nothing runs yet: a no-op, or the conflict dialog (cancelling that
+        // keeps the cut for another try).
+        if cut {
+            self.clipboard = None;
+        }
+        self.check_and_transfer(
             if cut { OpKind::Move } else { OpKind::Copy },
             paths,
             dest,
+            cut,
             window,
             cx,
         );
@@ -1943,6 +2023,163 @@ mod tests {
         assert_eq!(filter, "", "⌘Z undid the typing instead");
     }
 
+    /// Moving items into the folder they're already in, with the folder
+    /// spelled differently (`/tmp`, `/private/tmp`, the firmlink), does
+    /// nothing: no "already exists" dialog, no "a copy" rename.
+    #[gpui::test]
+    async fn move_into_own_folder_in_another_spelling_does_nothing(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+        let real = dir.path().to_path_buf();
+        let rel = real.strip_prefix("/private/tmp").unwrap().to_path_buf();
+        std::fs::write(real.join("a.txt"), b"a").unwrap();
+        let (ws, cx) = open(cx, Location::Dir(real.clone()));
+        for dest in [
+            Path::new("/tmp").join(&rel),
+            Path::new("/System/Volumes/Data/private/tmp").join(&rel),
+        ] {
+            ws.update_in(cx, |ws, window, cx| {
+                ws.start_transfer(
+                    OpKind::Move,
+                    vec![real.join("a.txt")],
+                    dest.clone(),
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            ws.read_with(cx, |ws, _| assert!(ws.overlay.is_none(), "{dest:?}"));
+            assert_eq!(std::fs::read(real.join("a.txt")).unwrap(), b"a");
+            assert!(!real.join("a copy.txt").exists());
+        }
+    }
+
+    fn job_errors(ws: &Workspace) -> Vec<String> {
+        ws.jobs
+            .iter()
+            .filter_map(|j| j.progress.error.lock().ok().and_then(|e| e.clone()))
+            .collect()
+    }
+
+    /// ⌘V pressed twice before the first paste's background check returns
+    /// moves the cut once: the second paste finds the clipboard taken.
+    #[gpui::test]
+    async fn cut_pasted_twice_moves_once(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        std::fs::create_dir(root.join("dst")).unwrap();
+        let (ws, cx) = open(cx, Location::Dir(root.join("dst")));
+        ws.update_in(cx, |ws, window, cx| {
+            ws.clipboard = Some((vec![root.join("projects/readme.md")], true));
+            ws.paste(window, cx);
+            ws.paste(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(root.join("dst/readme.md").exists());
+        assert!(!root.join("projects/readme.md").exists());
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.jobs.len(), 1, "one move job");
+            assert!(job_errors(ws).is_empty(), "{:?}", job_errors(ws));
+            assert!(ws.toast.as_ref().is_none_or(|t| !t.error));
+            assert!(ws.clipboard.is_none(), "the cut is consumed");
+        });
+    }
+
+    /// A cut pasted into the folder it's already in does nothing and stays
+    /// on the clipboard, as before the check moved off the UI thread.
+    #[gpui::test]
+    async fn cut_pasted_into_its_own_folder_stays_on_the_clipboard(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.join("projects")));
+        let cut = vec![root.join("projects/readme.md")];
+        ws.update_in(cx, |ws, window, cx| {
+            ws.clipboard = Some((cut.clone(), true));
+            ws.paste(window, cx);
+        });
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.clipboard, Some((cut.clone(), true)));
+            assert!(ws.jobs.is_empty());
+        });
+    }
+
+    fn confirm_overlay() -> Overlay {
+        Overlay::Confirm {
+            title: "t".into(),
+            body: "b".into(),
+            confirm: "OK".into(),
+            action: Box::new(crate::actions::OpenSettings),
+        }
+    }
+
+    /// A conflict found in the background never replaces a dialog that
+    /// opened meanwhile: it shows once that dialog closes.
+    #[gpui::test]
+    async fn conflict_waits_for_a_dialog_opened_meanwhile(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        std::fs::create_dir(root.join("dst")).unwrap();
+        std::fs::write(root.join("dst/readme.md"), b"other").unwrap();
+        let (ws, cx) = open(cx, Location::Dir(root.join("dst")));
+        ws.update_in(cx, |ws, window, cx| {
+            ws.start_transfer(
+                OpKind::Copy,
+                vec![root.join("projects/readme.md")],
+                root.join("dst"),
+                window,
+                cx,
+            );
+            ws.overlay = Some(confirm_overlay());
+        });
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| {
+            assert!(matches!(ws.overlay, Some(Overlay::Confirm { .. })))
+        });
+        ws.update_in(cx, |ws, window, cx| ws.close_overlay(window, cx));
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| {
+            assert!(matches!(ws.overlay, Some(Overlay::Conflict { .. })))
+        });
+    }
+
+    /// Two transfers that both conflict: neither dialog is lost; the second
+    /// shows after the first closes.
+    #[gpui::test]
+    async fn two_conflicts_show_one_after_the_other(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        for d in ["dst1", "dst2"] {
+            std::fs::create_dir(root.join(d)).unwrap();
+            std::fs::write(root.join(d).join("readme.md"), b"other").unwrap();
+        }
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        ws.update_in(cx, |ws, window, cx| {
+            for d in ["dst1", "dst2"] {
+                ws.start_transfer(
+                    OpKind::Copy,
+                    vec![root.join("projects/readme.md")],
+                    root.join(d),
+                    window,
+                    cx,
+                );
+            }
+        });
+        let mut shown = Vec::new();
+        for _ in 0..2 {
+            cx.run_until_parked();
+            ws.update_in(cx, |ws, window, cx| {
+                match &ws.overlay {
+                    Some(Overlay::Conflict { dest, .. }) => shown.push(dest.clone()),
+                    _ => panic!("expected a conflict dialog"),
+                }
+                ws.close_overlay(window, cx);
+            });
+        }
+        shown.sort();
+        assert_eq!(shown, vec![root.join("dst1"), root.join("dst2")]);
+    }
+
     #[gpui::test]
     async fn cancelled_conflict_keeps_the_cut(cx: &mut TestAppContext) {
         init(cx);
@@ -1954,6 +2191,10 @@ mod tests {
         ws.update_in(cx, |ws, window, cx| {
             ws.clipboard = Some((cut.clone(), true));
             ws.paste(window, cx);
+        });
+        // The conflict check runs in the background.
+        cx.run_until_parked();
+        ws.update_in(cx, |ws, window, cx| {
             assert!(matches!(ws.overlay, Some(Overlay::Conflict { .. })));
             ws.close_overlay(window, cx);
         });
