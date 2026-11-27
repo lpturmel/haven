@@ -296,7 +296,7 @@ pub fn conflicts(sources: &[PathBuf], dest: &Path) -> Vec<PathBuf> {
         .iter()
         .filter_map(|s| {
             let target = dest.join(s.file_name()?);
-            (fs::symlink_metadata(&target).is_ok() && target != *s).then_some(target)
+            (fs::symlink_metadata(&target).is_ok() && !same_item(&target, s)).then_some(target)
         })
         .collect()
 }
@@ -378,32 +378,75 @@ pub fn move_path(from: &Path, to: &Path, progress: &Progress) -> io::Result<()> 
     }
 }
 
-/// Resolves symlinks (`/tmp` → `/private/tmp`) so two spellings of one
-/// folder compare equal. Falls back to the path as given when it can't be
-/// resolved (it may not exist yet).
-fn resolved(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// A file's identity on disk: `(device, inode)`. Two paths name the same
+/// item exactly when their identities match, however they are spelled
+/// (`/tmp/…`, `/private/tmp/…`, or the firmlink
+/// `/System/Volumes/Data/private/tmp/…`, which `canonicalize` leaves as is).
+type FileId = (u64, u64);
+
+fn file_id(meta: &fs::Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
 }
 
-/// Like `resolved`, but a symlink stays itself: only its parent folder is
-/// resolved. Moving or copying a link moves the link, not what it points to.
-fn resolved_item(path: &Path) -> PathBuf {
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => resolved(parent).join(name),
-        _ => resolved(path),
-    }
+/// The identity of the item at `path` itself: a symlink is itself, not what
+/// it points to. Moving or copying a link moves the link.
+fn item_id(path: &Path) -> Option<FileId> {
+    fs::symlink_metadata(path).ok().map(|m| file_id(&m))
 }
 
-/// The first of `sources` that `dest` is, or lies inside, once symlinks are
-/// resolved. Moving or copying it into `dest` would put a folder inside
-/// itself. A dragged symlink counts as the link, not its target. Touches the
-/// filesystem: call it off the UI thread.
+/// Whether `a` and `b` name the same item (a symlink is itself).
+fn same_item(a: &Path, b: &Path) -> bool {
+    a == b || matches!((item_id(a), item_id(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// The identities of the folder `path` names and of every folder above it
+/// on disk (links followed). A path that doesn't exist yet starts at its
+/// nearest existing ancestor. Only identities are compared, so the spelling
+/// of the resolved path doesn't matter.
+fn ancestry(path: &Path) -> Vec<FileId> {
+    let Some(real) = path.ancestors().find_map(|p| fs::canonicalize(p).ok()) else {
+        return Vec::new();
+    };
+    real.ancestors()
+        .filter_map(|p| fs::metadata(p).ok().map(|m| file_id(&m)))
+        .collect()
+}
+
+/// Whether `container` is `item` or a folder holding it (a symlink
+/// `container` is only itself: trashing a link never touches its target).
+fn is_or_holds(container: &Path, item: &Path) -> bool {
+    let Some(c) = item_id(container) else {
+        return false;
+    };
+    item_id(item) == Some(c) || item.parent().is_some_and(|p| ancestry(p).contains(&c))
+}
+
+/// The first of `sources` that `dest` is, or lies inside, on disk, however
+/// either path is spelled. Moving or copying it into `dest` would put a
+/// folder inside itself. A dragged symlink counts as the link, not its
+/// target. Touches the filesystem: call it off the UI thread.
 pub fn source_containing(sources: &[PathBuf], dest: &Path) -> Option<PathBuf> {
-    let dest = resolved(dest);
+    let chain = ancestry(dest);
     sources
         .iter()
-        .find(|s| dest.starts_with(resolved_item(s)))
+        .find(|s| item_id(s).is_some_and(|id| chain.contains(&id)))
         .cloned()
+}
+
+/// Whether every one of `sources` already sits directly in `dest`, so moving
+/// them there does nothing. Compares identities, so any spelling of either
+/// path matches. Touches the filesystem: call it off the UI thread.
+pub fn already_in(sources: &[PathBuf], dest: &Path) -> bool {
+    let Ok(d) = fs::metadata(dest).map(|m| file_id(&m)) else {
+        return false;
+    };
+    !sources.is_empty()
+        && sources.iter().all(|s| {
+            s.parent()
+                .and_then(|p| fs::metadata(p).ok())
+                .is_some_and(|m| file_id(&m) == d)
+        })
 }
 
 /// Copies or moves `sources` into `dest`. Returns an undo record; on failure
@@ -447,9 +490,10 @@ pub fn transfer(
                 continue;
             };
             let mut target = dest.join(name);
-            // Compared resolved: `/tmp/x/a` moved into `/private/tmp/x` is
-            // already where it belongs (not a conflict with itself).
-            let same = resolved_item(&target) == resolved_item(src);
+            // By identity: `/tmp/x/a` moved into `/private/tmp/x` (or its
+            // firmlink spelling) is already where it belongs, not a
+            // conflict with itself.
+            let same = same_item(&target, src);
             if same && kind == OpKind::Move {
                 continue;
             }
@@ -461,7 +505,7 @@ pub fn transfer(
                         // (moving `/x/a/a` into `/x` would trash `/x/a`),
                         // however either path is spelled. (`dest` inside
                         // `src` was refused up front.)
-                        if resolved_item(src).starts_with(resolved_item(&target)) {
+                        if is_or_holds(&target, src) {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
                                 "cannot replace a folder with itself",
@@ -1261,23 +1305,140 @@ mod tests {
         assert!(!root.join("x/a copy.txt").exists());
     }
 
-    /// With Replace, the "existing item" is the source itself: it must never
-    /// be trashed.
+    /// A scratch folder under `/private/tmp` and three spellings of it:
+    /// `/tmp/…` (symlink), `/private/tmp/…` (real) and
+    /// `/System/Volumes/Data/private/tmp/…` (firmlink, which `canonicalize`
+    /// leaves as is).
+    fn tmp_spellings() -> (tempfile::TempDir, [PathBuf; 3]) {
+        let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+        let real = dir.path().to_path_buf();
+        let rel = real.strip_prefix("/private/tmp").unwrap().to_path_buf();
+        let spellings = [
+            Path::new("/tmp").join(&rel),
+            real,
+            Path::new("/System/Volumes/Data/private/tmp").join(&rel),
+        ];
+        (dir, spellings)
+    }
+
+    /// Every (source spelling, destination spelling) pair.
+    fn spelling_pairs(sp: &[PathBuf; 3]) -> Vec<(&PathBuf, &PathBuf)> {
+        sp.iter()
+            .flat_map(|a| sp.iter().map(move |b| (a, b)))
+            .collect()
+    }
+
     #[test]
-    fn replace_into_own_folder_spelled_differently_keeps_the_source() {
-        let (_d, root) = setup();
-        fs::create_dir(root.join("x")).unwrap();
-        fs::write(root.join("x/a.txt"), b"a").unwrap();
-        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
-        transfer(
-            OpKind::Move,
-            &[root.join("alias/x/a.txt")],
-            &root.join("x"),
-            Conflict::Replace,
-            &Progress::default(),
-        )
-        .unwrap();
-        assert_eq!(fs::read(root.join("x/a.txt")).unwrap(), b"a");
+    fn move_into_own_folder_is_a_no_op_in_any_spelling() {
+        let (_d, sp) = tmp_spellings();
+        fs::create_dir(sp[1].join("x")).unwrap();
+        fs::write(sp[1].join("x/a.txt"), b"a").unwrap();
+        for (a, b) in spelling_pairs(&sp) {
+            transfer(
+                OpKind::Move,
+                &[a.join("x/a.txt")],
+                &b.join("x"),
+                Conflict::KeepBoth,
+                &Progress::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(sp[1].join("x/a.txt")).unwrap(),
+                b"a",
+                "{a:?} -> {b:?}"
+            );
+            assert!(!sp[1].join("x/a copy.txt").exists(), "{a:?} -> {b:?}");
+        }
+    }
+
+    #[test]
+    fn conflicts_ignore_the_item_itself_in_any_spelling() {
+        let (_d, sp) = tmp_spellings();
+        fs::create_dir_all(sp[1].join("x")).unwrap();
+        fs::create_dir_all(sp[1].join("y")).unwrap();
+        fs::write(sp[1].join("x/a.txt"), b"a").unwrap();
+        fs::write(sp[1].join("y/a.txt"), b"other").unwrap();
+        for (a, b) in spelling_pairs(&sp) {
+            assert!(
+                conflicts(&[a.join("x/a.txt")], &b.join("x")).is_empty(),
+                "{a:?} -> {b:?}"
+            );
+            // A different file with the same name still conflicts.
+            assert_eq!(
+                conflicts(&[a.join("y/a.txt")], &b.join("x")),
+                vec![b.join("x/a.txt")]
+            );
+        }
+    }
+
+    #[test]
+    fn source_containing_matches_any_spelling() {
+        let (_d, sp) = tmp_spellings();
+        fs::create_dir_all(sp[1].join("D/pinA/sub")).unwrap();
+        for (a, b) in spelling_pairs(&sp) {
+            let src = a.join("D/pinA");
+            assert_eq!(
+                source_containing(std::slice::from_ref(&src), &b.join("D/pinA/sub")),
+                Some(src.clone()),
+                "{a:?} -> {b:?}"
+            );
+            assert_eq!(
+                source_containing(std::slice::from_ref(&src), &b.join("D/pinA")),
+                Some(src.clone())
+            );
+            // A destination that doesn't exist yet: its nearest existing
+            // ancestor decides.
+            assert_eq!(
+                source_containing(std::slice::from_ref(&src), &b.join("D/pinA/sub/new")),
+                Some(src.clone())
+            );
+            assert_eq!(
+                source_containing(std::slice::from_ref(&src), &b.join("D")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn move_into_a_dragged_folder_refuses_in_any_spelling() {
+        let (_d, sp) = tmp_spellings();
+        fs::create_dir_all(sp[1].join("D/pinA/sub")).unwrap();
+        fs::write(sp[1].join("D/five.txt"), b"5").unwrap();
+        for (a, b) in spelling_pairs(&sp) {
+            for policy in [Conflict::KeepBoth, Conflict::Replace] {
+                let out = transfer(
+                    OpKind::Move,
+                    &[a.join("D/five.txt"), a.join("D/pinA")],
+                    &b.join("D/pinA/sub"),
+                    policy,
+                    &Progress::default(),
+                );
+                assert!(out.is_err(), "{a:?} -> {b:?}");
+                assert!(sp[1].join("D/five.txt").exists());
+                assert!(sp[1].join("D/pinA/sub").is_dir());
+            }
+        }
+    }
+
+    /// Replace never trashes a folder holding the source, in any spelling
+    /// (moving `/x/a/a` into `/x` would trash `/x/a`). Refused before
+    /// anything is trashed.
+    #[test]
+    fn replace_never_trashes_a_folder_holding_the_source_in_any_spelling() {
+        let (_d, sp) = tmp_spellings();
+        fs::create_dir_all(sp[1].join("x/a/a")).unwrap();
+        fs::write(sp[1].join("x/a/a/keep.txt"), b"k").unwrap();
+        for (a, b) in spelling_pairs(&sp) {
+            let out = transfer(
+                OpKind::Move,
+                &[a.join("x/a/a")],
+                &b.join("x"),
+                Conflict::Replace,
+                &Progress::default(),
+            );
+            assert!(out.is_err(), "{a:?} -> {b:?}");
+            assert_eq!(fs::read(sp[1].join("x/a/a/keep.txt")).unwrap(), b"k");
+        }
     }
 
     #[test]

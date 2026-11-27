@@ -889,22 +889,42 @@ impl Workspace {
         if sources.is_empty() {
             return;
         }
-        if kind == OpKind::Move && sources.iter().all(|s| s.parent() == Some(dest.as_path())) {
-            return;
-        }
-        let conflicts = ops::conflicts(&sources, &dest);
-        if !conflicts.is_empty() {
-            self.overlay = Some(Overlay::Conflict {
-                kind,
-                sources,
-                dest,
-                count: conflicts.len(),
+        // Both checks touch the filesystem, so they run off the UI thread.
+        // They compare identities, so a move into the folder the items are
+        // already in is a no-op (and an item is never "in conflict" with
+        // itself) however either path is spelled.
+        cx.spawn_in(window, async move |this, cx| {
+            let check = {
+                let (sources, dest) = (sources.clone(), dest.clone());
+                cx.background_executor()
+                    .spawn(async move {
+                        if kind == OpKind::Move && ops::already_in(&sources, &dest) {
+                            None
+                        } else {
+                            Some(ops::conflicts(&sources, &dest).len())
+                        }
+                    })
+                    .await
+            };
+            let Some(count) = check else {
+                return;
+            };
+            let _ = this.update_in(cx, |ws, window, cx| {
+                if count > 0 {
+                    ws.overlay = Some(Overlay::Conflict {
+                        kind,
+                        sources,
+                        dest,
+                        count,
+                    });
+                    window.focus(&ws.focus);
+                    cx.notify();
+                } else {
+                    ws.run_transfer(kind, sources, dest, Conflict::KeepBoth, cx);
+                }
             });
-            window.focus(&self.focus);
-            cx.notify();
-            return;
-        }
-        self.run_transfer(kind, sources, dest, Conflict::KeepBoth, cx);
+        })
+        .detach();
     }
 
     pub fn run_transfer(
@@ -1943,6 +1963,37 @@ mod tests {
         assert_eq!(filter, "", "⌘Z undid the typing instead");
     }
 
+    /// Moving items into the folder they're already in, with the folder
+    /// spelled differently (`/tmp`, `/private/tmp`, the firmlink), does
+    /// nothing: no "already exists" dialog, no "a copy" rename.
+    #[gpui::test]
+    async fn move_into_own_folder_in_another_spelling_does_nothing(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+        let real = dir.path().to_path_buf();
+        let rel = real.strip_prefix("/private/tmp").unwrap().to_path_buf();
+        std::fs::write(real.join("a.txt"), b"a").unwrap();
+        let (ws, cx) = open(cx, Location::Dir(real.clone()));
+        for dest in [
+            Path::new("/tmp").join(&rel),
+            Path::new("/System/Volumes/Data/private/tmp").join(&rel),
+        ] {
+            ws.update_in(cx, |ws, window, cx| {
+                ws.start_transfer(
+                    OpKind::Move,
+                    vec![real.join("a.txt")],
+                    dest.clone(),
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            ws.read_with(cx, |ws, _| assert!(ws.overlay.is_none(), "{dest:?}"));
+            assert_eq!(std::fs::read(real.join("a.txt")).unwrap(), b"a");
+            assert!(!real.join("a copy.txt").exists());
+        }
+    }
+
     #[gpui::test]
     async fn cancelled_conflict_keeps_the_cut(cx: &mut TestAppContext) {
         init(cx);
@@ -1954,6 +2005,10 @@ mod tests {
         ws.update_in(cx, |ws, window, cx| {
             ws.clipboard = Some((cut.clone(), true));
             ws.paste(window, cx);
+        });
+        // The conflict check runs in the background.
+        cx.run_until_parked();
+        ws.update_in(cx, |ws, window, cx| {
             assert!(matches!(ws.overlay, Some(Overlay::Conflict { .. })));
             ws.close_overlay(window, cx);
         });
