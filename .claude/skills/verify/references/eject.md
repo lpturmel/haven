@@ -65,7 +65,9 @@ no volume says "Nothing to eject here".
    page, and the drive leaves the sidebar within about 5s
    (`mount | grep HavenEjectTest` is empty).
 3. Re-attach. Right-click the drive row: the menu has "Open in New Tab" and
-   "Eject" (with ⌘E). Eject from there.
+   "Eject". It shows no shortcut: "Eject" there dispatches
+   `EjectVolume(mount)`, while ⌘E is bound to `EjectSelected` (step 4).
+   Eject from there.
 4. Re-attach. Navigate into the volume and press ⌘E (also File ▸ Eject).
 5. Busy case: re-attach, run `sleep 600 < /Volumes/HavenEjectTest/busy.txt &`
    (create the file first), eject from Haven. Expect a red toast
