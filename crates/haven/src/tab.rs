@@ -136,6 +136,9 @@ pub struct Tab {
     size_control: Option<Arc<Control>>,
     pub sizing: bool,
     pub grid_cols: usize,
+    /// Width of the list view's body, measured each frame; decides which
+    /// optional columns fit (see `views::list::Columns`).
+    pub list_width: f32,
 }
 
 impl EventEmitter<TabEvent> for Tab {}
@@ -177,6 +180,7 @@ impl Tab {
             size_control: None,
             sizing: false,
             grid_cols: 1,
+            list_width: 0.,
         };
         tab.navigate(location, false, cx);
         tab

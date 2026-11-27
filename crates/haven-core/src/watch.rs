@@ -114,7 +114,22 @@ impl DirWatcher {
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// Waits for an event for `want`. FSEvents may first deliver unrelated
+    /// events (e.g. for the temp dir's own creation), so skip those.
+    fn wait_for(rx: &mpsc::Receiver<PathBuf>, want: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(got) if got == want => return,
+                Ok(got) => seen.push(got),
+                Err(_) => break,
+            }
+        }
+        panic!("no change event for {}; got {seen:?}", want.display());
+    }
 
     #[test]
     fn reports_changes_in_watched_dir() {
@@ -128,10 +143,7 @@ mod tests {
         w.watch(&root);
         std::thread::sleep(Duration::from_millis(200));
         std::fs::write(root.join("new.txt"), b"x").unwrap();
-        let got = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("change event");
-        assert_eq!(got, root);
+        wait_for(&rx, &root);
         w.unwatch(&root);
         assert!(w.counts.is_empty());
     }
@@ -152,10 +164,7 @@ mod tests {
         w.watch(&root.join("link"));
         std::thread::sleep(Duration::from_millis(200));
         std::fs::write(root.join("real/new.txt"), b"x").unwrap();
-        let got = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("change event");
-        assert_eq!(got, root.join("link"));
+        wait_for(&rx, &root.join("link"));
         w.unwatch(&root.join("link"));
         assert!(w.aliases.lock().unwrap().is_empty());
     }

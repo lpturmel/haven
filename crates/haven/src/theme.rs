@@ -11,6 +11,9 @@ pub struct Theme {
     pub sidebar_label: Hsla,
     /// Row icons on the frosted sidebar.
     pub sidebar_icon: Hsla,
+    /// Hovered sidebar rows: a touch stronger than `hover`, which is too
+    /// faint over the frosted material.
+    pub sidebar_hover: Hsla,
     pub card_bg: Hsla,
     pub card_border: Hsla,
     pub elevated: Hsla,
@@ -47,6 +50,7 @@ impl Theme {
             sidebar_bg: hsla(240. / 360., 0.06, 0.08, 0.35),
             sidebar_label: hsla(0., 0., 1., 0.62),
             sidebar_icon: hsla(0., 0., 1., 0.72),
+            sidebar_hover: hsla(0., 0., 1., 0.07),
             card_bg: rgb(0x1c1c1f).into(),
             card_border: hsla(0., 0., 1., 0.08),
             elevated: rgb(0x26262b).into(),

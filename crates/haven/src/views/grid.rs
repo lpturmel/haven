@@ -7,7 +7,7 @@ use gpui::{
 };
 use haven_core::kind::is_image_ext;
 
-use super::{drag_payload, drag_preview, entry_icon_el};
+use super::{drag_payload, drag_preview, entry_icon_el, file_drop_target};
 use crate::store::Store;
 use crate::tab::{DraggedFiles, Tab};
 use crate::theme::theme;
@@ -162,13 +162,11 @@ fn tile(
         .on_click(cx.listener(move |tab, _, _, cx| tab.click_item(ix, cx)))
         .on_drag(payload, |files, _, _, cx| drag_preview(files, cx))
         .when(navigable, |d| {
-            d.drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(t.selection))
-                .on_drop(cx.listener(move |tab, files: &DraggedFiles, window, cx| {
-                    cx.stop_propagation();
-                    if !files.paths.contains(&path) {
-                        tab.drop_on(path.clone(), files.paths.clone(), window, cx);
-                    }
-                }))
+            file_drop_target(d, t.selection, cx, move |tab, paths, window, cx| {
+                if !paths.contains(&path) {
+                    tab.drop_on(path.clone(), paths, window, cx);
+                }
+            })
         })
         .child(
             div()

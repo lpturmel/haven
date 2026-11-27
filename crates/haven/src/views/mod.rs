@@ -4,9 +4,12 @@ pub mod list;
 pub mod preview;
 pub mod start;
 
+use std::path::PathBuf;
+use std::rc::Rc;
+
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, IntoElement, ParentElement, Styled, Window, div,
-    img, px,
+    AnyElement, App, AppContext, Context, Entity, ExternalPaths, Hsla, InteractiveElement,
+    IntoElement, ParentElement, Styled, Window, div, img, px,
 };
 use haven_core::Entry;
 
@@ -91,4 +94,32 @@ pub fn drag_payload(tab: &Tab, ix: usize) -> DraggedFiles {
                 .unwrap_or_default(),
         }
     }
+}
+
+/// Makes `el` accept files dropped from inside Haven (`DraggedFiles`) and
+/// from other apps such as Finder (`ExternalPaths`), tinted with `highlight`
+/// while a drag hovers it. Both kinds go through the same `on_drop`, so drops
+/// follow the same move/copy rules wherever they come from.
+pub fn file_drop_target<E, V>(
+    el: E,
+    highlight: Hsla,
+    cx: &Context<V>,
+    on_drop: impl Fn(&mut V, Vec<PathBuf>, &mut Window, &mut Context<V>) + 'static,
+) -> E
+where
+    E: InteractiveElement,
+    V: 'static,
+{
+    let on_drop = Rc::new(on_drop);
+    let internal = on_drop.clone();
+    el.drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(highlight))
+        .drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(highlight))
+        .on_drop(cx.listener(move |v, files: &DraggedFiles, window, cx| {
+            cx.stop_propagation();
+            internal(v, files.paths.clone(), window, cx)
+        }))
+        .on_drop(cx.listener(move |v, ext: &ExternalPaths, window, cx| {
+            cx.stop_propagation();
+            on_drop(v, ext.paths().to_vec(), window, cx)
+        }))
 }

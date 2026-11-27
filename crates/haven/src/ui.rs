@@ -141,3 +141,29 @@ pub trait Ellipsis: gpui::Styled + Sized {
 }
 
 impl<T: gpui::Styled> Ellipsis for T {}
+
+/// A small hover tooltip (use with `.tooltip(|_, cx| tooltip("…", cx))`).
+pub struct Tooltip(SharedString);
+
+impl gpui::Render for Tooltip {
+    fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let t = theme(cx);
+        div()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(5.))
+            .bg(t.popover_bg)
+            .border_1()
+            .border_color(t.card_border)
+            .font_family(crate::theme::UI_FONT)
+            .text_size(px(12.))
+            .text_color(t.text)
+            .child(self.0.clone())
+    }
+}
+
+pub fn tooltip(text: impl Into<SharedString>, cx: &mut App) -> gpui::AnyView {
+    use gpui::AppContext as _;
+    let text = text.into();
+    cx.new(|_| Tooltip(text)).into()
+}

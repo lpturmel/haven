@@ -13,6 +13,7 @@ use haven_core::volumes::Volume;
 use haven_core::{Entry, fmt, tildify};
 
 use super::entry_icon_el;
+use crate::actions::EjectVolume;
 use crate::actions::NavigateTo;
 use crate::store::Store;
 use crate::tab::{DraggedFiles, Location, Tab};
@@ -197,6 +198,27 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                                 ),
                             ),
                     )
+                    .when(v.ejectable, |d| {
+                        let m = v.mount.clone();
+                        d.child(
+                            div()
+                                .id(("eject-drive", i))
+                                .size(px(26.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(t.hover))
+                                .tooltip(|_, cx| crate::ui::tooltip("Eject", cx))
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.dispatch_action(Box::new(EjectVolume(m.clone())), cx);
+                                })
+                                .child(icon("eject").size(px(14.)).text_color(t.text_muted)),
+                        )
+                    })
                     .into_any_element()
             })
             .collect();

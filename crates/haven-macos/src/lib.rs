@@ -92,6 +92,27 @@ pub fn apps_for(path: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// Starts a native macOS drag of `paths` from `ns_view`, so files can be
+/// dropped onto Finder, the Desktop, Mail and other apps. Must be called on
+/// the main thread while a left-mouse drag event is being handled (AppKit
+/// needs that event to start the session). Returns false if no drag could be
+/// started; the caller then keeps its own in-app drag going.
+///
+/// # Safety
+/// `ns_view` must be a valid `NSView` pointer that outlives this call.
+pub unsafe fn begin_file_drag(ns_view: *mut std::ffi::c_void, paths: &[PathBuf]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: forwarded caller contract.
+        unsafe { imp::begin_file_drag(ns_view, paths) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (ns_view, paths);
+        false
+    }
+}
+
 /// Forces the dark Aqua appearance app-wide (so vibrancy renders dark). Must be
 /// called on the main thread; does nothing elsewhere.
 pub fn force_dark_appearance() {
@@ -221,6 +242,109 @@ mod imp {
             Some(content),
         );
         true
+    }
+
+    use objc2_app_kit::NSDraggingSource;
+    use objc2_foundation::{NSObject, NSObjectProtocol};
+
+    objc2::define_class!(
+        /// Drag source for files dragged out of Haven. The destination picks
+        /// the operation (Finder moves within a volume and copies across).
+        #[unsafe(super(NSObject))]
+        #[thread_kind = objc2::MainThreadOnly]
+        #[name = "HavenFileDragSource"]
+        struct FileDragSource;
+
+        unsafe impl NSObjectProtocol for FileDragSource {}
+
+        unsafe impl NSDraggingSource for FileDragSource {
+            #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
+            fn source_operation_mask(
+                &self,
+                _session: &objc2_app_kit::NSDraggingSession,
+                context: objc2_app_kit::NSDraggingContext,
+            ) -> objc2_app_kit::NSDragOperation {
+                use objc2_app_kit::{NSDragOperation, NSDraggingContext};
+                if context == NSDraggingContext::OutsideApplication {
+                    NSDragOperation::Copy
+                        | NSDragOperation::Move
+                        | NSDragOperation::Link
+                        | NSDragOperation::Generic
+                        | NSDragOperation::Delete
+                } else {
+                    NSDragOperation::Copy | NSDragOperation::Move | NSDragOperation::Generic
+                }
+            }
+        }
+    );
+
+    impl FileDragSource {
+        fn new(mtm: objc2::MainThreadMarker) -> Retained<Self> {
+            let this = mtm.alloc::<Self>().set_ivars(());
+            // SAFETY: NSObject's designated initializer.
+            unsafe { objc2::msg_send![super(this), init] }
+        }
+    }
+
+    pub unsafe fn begin_file_drag(ns_view: *mut std::ffi::c_void, paths: &[PathBuf]) -> bool {
+        use objc2::MainThreadMarker;
+        use objc2::runtime::ProtocolObject;
+        use objc2_app_kit::{NSApplication, NSDraggingItem, NSEventType, NSView};
+        use objc2_foundation::NSArray;
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return false;
+        };
+        if ns_view.is_null() || paths.is_empty() {
+            return false;
+        }
+        // SAFETY: the caller guarantees a live NSView.
+        let view: &NSView = unsafe { &*(ns_view as *const NSView) };
+        // AppKit raises if the session isn't started from a mouse event.
+        let Some(event) = NSApplication::sharedApplication(mtm).currentEvent() else {
+            return false;
+        };
+        if event.r#type() != NSEventType::LeftMouseDragged {
+            return false;
+        }
+        autoreleasepool(|_| {
+            let at = view.convertPoint_fromView(event.locationInWindow(), None);
+            let workspace = NSWorkspace::sharedWorkspace();
+            let mut items = Vec::new();
+            for (i, path) in paths.iter().enumerate() {
+                let Some(s) = path.to_str() else { continue };
+                let ns_path = NSString::from_str(s);
+                let url = NSURL::fileURLWithPath(&ns_path);
+                let item = NSDraggingItem::initWithPasteboardWriter(
+                    NSDraggingItem::alloc(),
+                    ProtocolObject::from_ref(&*url),
+                );
+                // Up to a few stacked icons under the cursor, like Finder.
+                let icon = workspace.iconForFile(&ns_path);
+                let offset = (i.min(4) as f64) * 4.0;
+                let frame = NSRect::new(
+                    NSPoint::new(at.x - 24.0 + offset, at.y - 24.0 - offset),
+                    NSSize::new(48.0, 48.0),
+                );
+                // SAFETY: an NSImage is a valid dragging-frame content.
+                unsafe { item.setDraggingFrame_contents(frame, Some(&icon)) };
+                items.push(item);
+            }
+            if items.is_empty() {
+                return false;
+            }
+            let items = NSArray::from_retained_slice(&items);
+            let source = FileDragSource::new(mtm);
+            let session = view.beginDraggingSessionWithItems_event_source(
+                &items,
+                &event,
+                ProtocolObject::from_ref(&*source),
+            );
+            // Dropping back on the window that started the drag shouldn't
+            // animate the files "sliding back" when nothing accepted them.
+            session.setAnimatesToStartingPositionsOnCancelOrFail(true);
+            true
+        })
     }
 
     pub fn trash(path: &Path) -> Result<PathBuf, String> {

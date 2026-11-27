@@ -1,6 +1,8 @@
 [workspace]
 members = ["crates/haven-core", "crates/haven-highlight", "crates/haven-macos", "crates/haven"]
 resolver = "2"
+# Vendored third-party code: not linted or tested as part of Haven.
+exclude = ["vendor/gpui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +28,11 @@ regex = "1"
 haven-core = { path = "crates/haven-core" }
 haven-highlight = { path = "crates/haven-highlight" }
 haven-macos = { path = "crates/haven-macos" }
+
+# Haven patches gpui's macOS glyph rasterizer (font smoothing); see
+# vendor/gpui/HAVEN_PATCHES.md.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
 
 [profile.release]
 lto = "thin"

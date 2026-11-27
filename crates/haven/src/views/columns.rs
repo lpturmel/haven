@@ -15,6 +15,7 @@ use crate::tab::{Location, Tab};
 use crate::theme::theme;
 use crate::ui::Ellipsis as _;
 use crate::ui::icon;
+use crate::views::file_drop_target;
 
 const COL_W: f32 = 230.;
 const ROW_H: f32 = 24.;
@@ -67,6 +68,14 @@ pub fn render(tab: &mut Tab, window: &mut Window, cx: &mut Context<Tab>) -> AnyE
                     tab.context_background(ev.position, window, cx);
                 }),
             )
+            .when_some(tab.dir().map(Path::to_path_buf), |d, dest| {
+                file_drop_target(
+                    d,
+                    gpui::transparent_black(),
+                    cx,
+                    move |tab, paths, window, cx| tab.drop_on(dest.clone(), paths, window, cx),
+                )
+            })
             .child(current)
             .into_any_element(),
     );
@@ -166,12 +175,12 @@ fn static_row(
         .id(ix)
         .w_full()
         .h(px(ROW_H))
-        .px(px(6.))
+        .px(px(8.))
         .flex()
         .items_center()
-        .gap(px(6.))
-        .rounded(px(5.))
-        .text_size(px(12.5))
+        .gap(px(8.))
+        .rounded(px(6.))
+        .text_size(px(13.))
         .when(highlighted, |d| d.bg(t.selection_inactive))
         .when(!highlighted, |d| d.hover(|s| s.bg(t.hover)))
         .on_mouse_down(
@@ -210,12 +219,12 @@ fn current_row(tab: &mut Tab, ix: usize, cx: &mut Context<Tab>) -> AnyElement {
         .id(ix)
         .w_full()
         .h(px(ROW_H))
-        .px(px(6.))
+        .px(px(8.))
         .flex()
         .items_center()
-        .gap(px(6.))
-        .rounded(px(5.))
-        .text_size(px(12.5))
+        .gap(px(8.))
+        .rounded(px(6.))
+        .text_size(px(13.))
         .when(selected, |d| d.bg(t.selection))
         .when(!selected, |d| d.hover(|s| s.bg(t.hover)))
         .on_mouse_down(
@@ -233,6 +242,14 @@ fn current_row(tab: &mut Tab, ix: usize, cx: &mut Context<Tab>) -> AnyElement {
             }),
         )
         .on_click(cx.listener(move |tab, _, _, cx| tab.click_item(ix, cx)))
+        .when(e.is_navigable(), |d| {
+            let dest = e.path.clone();
+            file_drop_target(d, t.selection, cx, move |tab, paths, window, cx| {
+                if !paths.contains(&dest) {
+                    tab.drop_on(dest.clone(), paths, window, cx);
+                }
+            })
+        })
         .on_drag(payload, |files, _, _, cx| drag_preview(files, cx))
         .child(entry_icon_el(&e, 16., cx))
         .child(

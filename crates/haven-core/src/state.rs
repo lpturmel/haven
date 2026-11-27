@@ -60,6 +60,9 @@ pub struct AppState {
     /// Command used for "Open in Editor".
     pub editor_command: String,
     pub respect_gitignore: bool,
+    /// Rasterize text with font smoothing (heavier, crisper glyphs like
+    /// native macOS text; matters most on non-Retina displays).
+    pub font_smoothing: bool,
 }
 
 impl Default for AppState {
@@ -94,6 +97,7 @@ impl Default for AppState {
             terminal_app,
             editor_command: "code".into(),
             respect_gitignore: true,
+            font_smoothing: true,
         }
     }
 }

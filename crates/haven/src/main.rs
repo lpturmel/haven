@@ -3,7 +3,9 @@
 mod actions;
 mod assets;
 mod icons;
+mod native_drag;
 mod overlays;
+mod settings;
 mod store;
 mod tab;
 mod tab_view;
@@ -43,8 +45,41 @@ fn initial_tabs(cx: &App, args: &[PathBuf]) -> (Vec<Location>, usize) {
     (tabs, session.active)
 }
 
+/// `HAVEN_DISPLAY=<n>` opens the window on the n-th display (0-based, in
+/// `cx.displays()` order). Used by validation runs to keep Haven visible on a
+/// secondary screen while the main one is busy.
+fn target_display(cx: &App) -> Option<gpui::DisplayId> {
+    let n: usize = std::env::var("HAVEN_DISPLAY").ok()?.parse().ok()?;
+    cx.displays().get(n).map(|d| d.id())
+}
+
+/// `HAVEN_WINDOW_SIZE=<w>x<h>` (points) sets the initial window size, e.g.
+/// `900x560` to check how the List view fits a narrow window.
+fn window_size() -> Option<(f32, f32)> {
+    parse_size(&std::env::var("HAVEN_WINDOW_SIZE").ok()?)
+}
+
+fn parse_size(s: &str) -> Option<(f32, f32)> {
+    let (w, h) = s.trim().split_once(['x', 'X'])?;
+    let (w, h): (f32, f32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+    // At least the window's minimum size.
+    (w > 0. && h > 0.).then_some((w.max(900.), h.max(560.)))
+}
+
+/// Font smoothing from Settings, unless `HAVEN_FONT_SMOOTHING=0|1` overrides
+/// it (for before/after captures).
+pub fn apply_font_smoothing(cx: &App) {
+    let on = match std::env::var("HAVEN_FONT_SMOOTHING").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => Store::get(cx).font_smoothing,
+    };
+    gpui::set_font_smoothing(on);
+}
+
 fn open_window(cx: &mut App, args: Vec<PathBuf>) -> WindowHandle<Workspace> {
-    let bounds = Bounds::centered(None, size(px(1240.), px(780.)), cx);
+    let (w, h) = window_size().unwrap_or((1240., 780.));
+    let bounds = Bounds::centered(target_display(cx), size(px(w), px(h)), cx);
     let (tabs, active) = initial_tabs(cx, &args);
     cx.open_window(
         WindowOptions {
@@ -99,6 +134,8 @@ fn menus() -> Vec<Menu> {
         Menu {
             name: "Haven".into(),
             items: vec![
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
                 MenuItem::action("Make Haven the Default File Viewer…", MakeDefaultViewer),
                 MenuItem::action("Restore Finder as Default", RestoreFinder),
                 MenuItem::separator(),
@@ -120,6 +157,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Duplicate", DuplicateSelected),
                 MenuItem::action("Edit Tags…", EditTags),
                 MenuItem::action("Move to Trash", TrashSelected),
+                MenuItem::separator(),
+                MenuItem::action("Eject", EjectSelected),
             ],
         },
         Menu {
@@ -187,11 +226,14 @@ fn main() {
         haven_macos::force_dark_appearance();
         cx.set_global(theme::Theme::dark());
         Store::init(cx);
+        apply_font_smoothing(cx);
         icons::IconCache::init(cx);
         cx.set_global(StartData::default());
         actions::bind_keys(cx);
         text_field::bind_keys(cx);
+        settings::bind_keys(cx);
         cx.set_menus(menus());
+        cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
         cx.on_action(|_: &Quit, cx| {
             workspace::wait_for_tag_writes();
             Store::flush(cx);
@@ -201,6 +243,7 @@ fn main() {
         // The window may be closed while the app keeps running (red button):
         // reopen events and opened URLs then create a fresh window.
         let handle = std::rc::Rc::new(std::cell::Cell::new(open_window(cx, args.clone())));
+        cx.set_global(settings::MainWindow(handle.get()));
 
         // Folders/files opened via Finder, `open -a Haven`, or NSFileViewer.
         let urls_handle = handle.clone();
@@ -232,7 +275,11 @@ fn main() {
                             }
                         })
                         .collect();
-                    if let Ok(w) = cx.update(|cx| open_window(cx, dirs)) {
+                    if let Ok(w) = cx.update(|cx| {
+                        let w = open_window(cx, dirs);
+                        cx.set_global(settings::MainWindow(w));
+                        w
+                    }) {
                         urls_handle.set(w);
                     }
                 }
@@ -246,7 +293,11 @@ fn main() {
                     .get()
                     .update(cx, |_, window, _| window.activate_window());
                 if shown.is_err()
-                    && let Ok(w) = cx.update(|cx| open_window(cx, Vec::new()))
+                    && let Ok(w) = cx.update(|cx| {
+                        let w = open_window(cx, Vec::new());
+                        cx.set_global(settings::MainWindow(w));
+                        w
+                    })
                 {
                     reopen_handle.set(w);
                 }
@@ -255,4 +306,19 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_size;
+
+    #[test]
+    fn parses_window_size_env() {
+        assert_eq!(parse_size("1000x700"), Some((1000., 700.)));
+        assert_eq!(parse_size(" 1200 X 800 "), Some((1200., 800.)));
+        // Clamped to the window's minimum size.
+        assert_eq!(parse_size("300x200"), Some((900., 560.)));
+        assert_eq!(parse_size("wide"), None);
+        assert_eq!(parse_size("0x0"), None);
+    }
 }
