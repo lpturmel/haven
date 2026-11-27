@@ -30,6 +30,11 @@ const CRUMB_ICON: f32 = 14.;
 const CRUMB_ICON_GAP: f32 = 5.;
 const CRUMB_GAP: f32 = 1.;
 const CHEVRON_W: f32 = 11.;
+/// The filter field's width, and the narrower one it takes when the content
+/// area (window minus sidebar) is under `NARROW_CONTENT_W`.
+const FILTER_W: f32 = 190.;
+const FILTER_W_NARROW: f32 = 130.;
+const NARROW_CONTENT_W: f32 = 760.;
 
 #[derive(Clone)]
 pub struct SidebarSplitter;
@@ -965,6 +970,19 @@ impl Workspace {
                         .text_color(if on { t.text } else { t.text_muted }),
                 )
         };
+        // In a narrow window the filter field gives the path bar some room,
+        // so the current folder's name still fits.
+        let content_w = f32::from(window.viewport_size().width)
+            - if self.sidebar_visible {
+                Store::get(cx).sidebar_width
+            } else {
+                0.
+            };
+        let filter_w = if content_w < NARROW_CONTENT_W {
+            FILTER_W_NARROW
+        } else {
+            FILTER_W
+        };
         let filter_focused = self
             .filter_field
             .read(cx)
@@ -998,7 +1016,7 @@ impl Workspace {
             .child(
                 div()
                     .id("filter")
-                    .w(px(190.))
+                    .w(px(filter_w))
                     .flex_none()
                     .h(px(30.))
                     .px(px(8.))
