@@ -405,4 +405,107 @@ mod tests {
             );
         }
     }
+
+    use crate::actions::TogglePreview;
+    use crate::views::start::StartData;
+    use crate::workspace::Workspace;
+    use gpui::{Entity, TestAppContext, VisualTestContext, size};
+
+    fn init(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::store::init_test_env();
+            crate::actions::bind_keys(cx);
+            crate::text_field::bind_keys(cx);
+            cx.set_global(crate::theme::Theme::dark());
+            Store::init(cx);
+            crate::icons::IconCache::init(cx);
+            cx.set_global(StartData::default());
+        });
+    }
+
+    /// Resizes the window, draws a frame (the canvas measures the list), then
+    /// draws again so the re-render it asked for lands.
+    fn resize(cx: &mut VisualTestContext, w: f32, h: f32) {
+        cx.simulate_resize(size(px(w), px(h)));
+        draw(cx);
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+    }
+
+    fn measured(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> (f32, Columns) {
+        ws.read_with(cx, |ws, cx| {
+            let w = ws.active_tab().read(cx).list_width;
+            (w, Columns::for_width(w))
+        })
+    }
+
+    #[gpui::test]
+    async fn list_width_follows_the_window_and_the_preview(cx: &mut TestAppContext) {
+        init(cx);
+        let root = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        std::fs::write(
+            root.join("a-file-with-a-rather-long-name-to-test-truncation.txt"),
+            b"x",
+        )
+        .unwrap();
+        cx.update(|cx| {
+            Store::update(cx, |s| {
+                s.preview_visible = true;
+                s.sidebar_width = 220.;
+                s.preview_width = 360.;
+            })
+        });
+        let (ws, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(vec![Location::Dir(root.clone())], 0, window, cx)
+        });
+        cx.run_until_parked();
+
+        // Wide window, preview on: every column fits.
+        resize(cx, 1600., 900.);
+        let (wide, cols) = measured(&ws, cx);
+        assert!(wide > 0., "the canvas never measured the list");
+        assert!(
+            cols.date && cols.size && cols.kind,
+            "wide: {wide} -> {cols:?}"
+        );
+
+        // The narrow-window bug: 900pt with the preview open. Only Size fits
+        // beside a readable Name column.
+        resize(cx, 900., 560.);
+        let (narrow, cols) = measured(&ws, cx);
+        assert!(narrow < wide);
+        assert!(narrow - H_PAD >= NAME_MIN_W, "name squeezed at {narrow}");
+        assert_eq!(
+            cols,
+            Columns {
+                date: false,
+                size: true,
+                kind: false
+            },
+            "narrow: {narrow}"
+        );
+
+        // Hiding the preview gives the list its room back, live.
+        cx.dispatch_action(TogglePreview);
+        draw(cx);
+        let (no_preview, cols) = measured(&ws, cx);
+        assert!(no_preview > narrow);
+        assert!(
+            cols.date && cols.size && cols.kind,
+            "no preview: {no_preview} -> {cols:?}"
+        );
+
+        // And showing it again drops them again.
+        cx.dispatch_action(TogglePreview);
+        draw(cx);
+        assert_eq!(measured(&ws, cx), (narrow, Columns::for_width(narrow)));
+        assert!(!measured(&ws, cx).1.date);
+    }
 }
