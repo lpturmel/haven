@@ -688,6 +688,11 @@ impl Workspace {
     /// when other volumes share its disk, asks before taking them too, like
     /// Finder. `confirmed` skips that question.
     pub fn eject(&mut self, mount: PathBuf, confirmed: bool, cx: &mut Context<Self>) {
+        // ⌘E again while "Eject All?" is up or waiting: that question is the
+        // answer. Planning again would ask a second time after a Cancel.
+        if !confirmed && self.asks_eject_all(&mount) {
+            return;
+        }
         if !self.ejecting.insert(mount.clone()) {
             return;
         }
@@ -710,17 +715,20 @@ impl Workspace {
         .detach();
     }
 
+    /// Whether "Eject All?" for `mount` is showing or waiting to show.
+    fn asks_eject_all(&self, mount: &Path) -> bool {
+        let answer = crate::actions::EjectVolumeConfirmed(mount.to_path_buf());
+        let asks = |o: &Overlay| matches!(o, Overlay::Confirm { action, .. } if action.partial_eq(&answer));
+        self.overlay.as_ref().is_some_and(asks) || self.queued_overlays.iter().any(asks)
+    }
+
     /// Asks before ejecting `mount` together with the other volumes on its
     /// disk. The answer arrives after a background plan, so the question
     /// waits behind any dialog opened meanwhile (see `show_queued_overlay`,
     /// which `render` calls) instead of replacing it.
     fn ask_eject_all(&mut self, mount: &Path, siblings: &[PathBuf], cx: &mut Context<Self>) {
-        // ⌘E again while the question is up (or waiting) asks nothing new.
-        let answer = crate::actions::EjectVolumeConfirmed(mount.to_path_buf());
-        let asks_already = |o: &Overlay| matches!(o, Overlay::Confirm { action, .. } if action.partial_eq(&answer));
-        if self.overlay.as_ref().is_some_and(asks_already)
-            || self.queued_overlays.iter().any(asks_already)
-        {
+        // Two plans in flight for the same drive ask only once.
+        if self.asks_eject_all(mount) {
             return;
         }
         let others: Vec<String> = siblings.iter().map(|p| volume_name(p)).collect();
@@ -2499,7 +2507,8 @@ mod tests {
             assert!(is_eject_all(&ws.overlay));
             assert!(!ws.has_queued_overlay());
         });
-        // Asking again while it's up (⌘E twice) doesn't queue a duplicate.
+        // Asking again while it's up (⌘E twice) neither queues a duplicate
+        // nor starts another plan that would ask again after a Cancel.
         ws.update_in(cx, |ws, _, cx| {
             ws.ask_eject_all(
                 Path::new("/Volumes/Disk A"),
@@ -2507,6 +2516,8 @@ mod tests {
                 cx,
             );
             assert!(!ws.has_queued_overlay());
+            ws.eject(PathBuf::from("/Volumes/Disk A"), false, cx);
+            assert!(ws.ejecting.is_empty(), "planned again");
         });
         // With nothing open, it shows straight away.
         ws.update_in(cx, |ws, window, cx| {
