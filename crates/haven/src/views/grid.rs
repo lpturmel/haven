@@ -30,7 +30,20 @@ fn label_lines(name: &str, width: Pixels, cx: &App) -> (SharedString, Option<Sha
     let (first, rest) = name.split_at(split);
     let mut runs = Vec::new();
     let second = wrapper.truncate_line(rest.trim_start().to_string().into(), width, "…", &mut runs);
-    (first.trim_end().to_string().into(), Some(second))
+    (
+        first.trim_end().to_string().into(),
+        Some(tidy_ellipsis(second)),
+    )
+}
+
+/// "long name …" → "long name…": a cut that lands on a space keeps it before
+/// the ellipsis, which reads like a missing word. Trimming only makes the
+/// line narrower, so it still fits.
+fn tidy_ellipsis(line: SharedString) -> SharedString {
+    match line.strip_suffix('…') {
+        Some(head) if head.ends_with(char::is_whitespace) => format!("{}…", head.trim_end()).into(),
+        _ => line,
+    }
 }
 
 pub fn tile_width(icon: f32) -> f32 {
@@ -237,6 +250,16 @@ fn tile(
 mod tests {
     use super::*;
 
+    #[test]
+    fn ellipsis_hugs_the_last_word() {
+        let t = |s: &str| tidy_ellipsis(SharedString::from(s.to_string())).to_string();
+        assert_eq!(t("long name …"), "long name…");
+        assert_eq!(t("long name  \t…"), "long name…");
+        assert_eq!(t("long name…"), "long name…");
+        // Not truncated: left alone, spaces and all.
+        assert_eq!(t("short name "), "short name ");
+    }
+
     #[gpui::test]
     fn long_labels_fit_two_lines(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -245,6 +268,7 @@ mod tests {
             let (first, second) = label_lines(name, width, cx);
             let second = second.expect("wraps to a second line");
             assert!(second.ends_with('…'), "{second}");
+            assert!(!second.ends_with(" …"), "{second}");
             assert!(name.starts_with(first.as_ref()));
             let mut w = cx
                 .text_system()
