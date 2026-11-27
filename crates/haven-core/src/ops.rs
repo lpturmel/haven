@@ -378,6 +378,34 @@ pub fn move_path(from: &Path, to: &Path, progress: &Progress) -> io::Result<()> 
     }
 }
 
+/// Resolves symlinks (`/tmp` → `/private/tmp`) so two spellings of one
+/// folder compare equal. Falls back to the path as given when it can't be
+/// resolved (it may not exist yet).
+fn resolved(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Like `resolved`, but a symlink stays itself: only its parent folder is
+/// resolved. Moving or copying a link moves the link, not what it points to.
+fn resolved_item(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => resolved(parent).join(name),
+        _ => resolved(path),
+    }
+}
+
+/// The first of `sources` that `dest` is, or lies inside, once symlinks are
+/// resolved. Moving or copying it into `dest` would put a folder inside
+/// itself. A dragged symlink counts as the link, not its target. Touches the
+/// filesystem: call it off the UI thread.
+pub fn source_containing(sources: &[PathBuf], dest: &Path) -> Option<PathBuf> {
+    let dest = resolved(dest);
+    sources
+        .iter()
+        .find(|s| dest.starts_with(resolved_item(s)))
+        .cloned()
+}
+
 /// Copies or moves `sources` into `dest`. Returns an undo record; on failure
 /// the error carries an undo record for the items that were already done.
 pub fn transfer(
@@ -400,6 +428,17 @@ pub fn transfer(
     let mut moved = Vec::new();
     let mut replaced = Vec::new();
     let result = (|| {
+        // Checked for every source before anything moves, so a bad drop
+        // fails whole instead of half-done.
+        if source_containing(sources, dest).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot {} a folder into itself",
+                    if kind == OpKind::Copy { "copy" } else { "move" }
+                ),
+            ));
+        }
         for src in sources {
             if progress.cancelled() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -429,15 +468,6 @@ pub fn transfer(
                     }
                     _ => target = unique_name(dest, &name.to_string_lossy()),
                 }
-            }
-            if dest.starts_with(src) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "cannot {} a folder into itself",
-                        if kind == OpKind::Copy { "copy" } else { "move" }
-                    ),
-                ));
             }
             match kind {
                 OpKind::Copy => {
@@ -818,6 +848,102 @@ mod tests {
             &Progress::default(),
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn finds_a_source_holding_the_destination_through_symlinks() {
+        let (_d, root) = setup();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir(root.join("c")).unwrap();
+        // `alias` plays `/tmp`, `root` plays `/private/tmp`.
+        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+        let a = root.join("alias/a");
+        // Equal, under another spelling.
+        assert_eq!(
+            source_containing(std::slice::from_ref(&a), &root.join("a")),
+            Some(a.clone())
+        );
+        // Inside it, under another spelling, either way round.
+        assert_eq!(
+            source_containing(std::slice::from_ref(&a), &root.join("a/b")),
+            Some(a.clone())
+        );
+        assert_eq!(
+            source_containing(&[root.join("a")], &root.join("alias/a/b")),
+            Some(root.join("a"))
+        );
+        // Not just the first source.
+        assert_eq!(
+            source_containing(&[root.join("c"), a.clone()], &root.join("a/b")),
+            Some(a.clone())
+        );
+        // A sibling, or a name that merely shares a prefix, is fine.
+        fs::create_dir(root.join("ab")).unwrap();
+        assert_eq!(
+            source_containing(&[root.join("c")], &root.join("a/b")),
+            None
+        );
+        assert_eq!(source_containing(&[a], &root.join("ab")), None);
+        // A destination that doesn't exist yet is compared as given.
+        assert_eq!(
+            source_containing(&[root.join("a")], &root.join("a/new")),
+            Some(root.join("a"))
+        );
+    }
+
+    #[test]
+    fn a_symlink_moves_into_the_folder_it_points_to() {
+        let (_d, root) = setup();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir(root.join("links")).unwrap();
+        std::os::unix::fs::symlink(root.join("a"), root.join("links/to_a")).unwrap();
+        let link = root.join("links/to_a");
+        for dest in [root.join("a"), root.join("a/b")] {
+            assert_eq!(source_containing(std::slice::from_ref(&link), &dest), None);
+        }
+        transfer(
+            OpKind::Move,
+            std::slice::from_ref(&link),
+            &root.join("a/b"),
+            Conflict::KeepBoth,
+            &Progress::default(),
+        )
+        .unwrap();
+        let moved = root.join("a/b/to_a");
+        assert!(
+            fs::symlink_metadata(&moved)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(fs::symlink_metadata(&link).is_err());
+        // Parents still resolve: a real folder dragged by an aliased path is
+        // still caught.
+        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+        assert_eq!(
+            source_containing(&[root.join("alias/a")], &root.join("a/b")),
+            Some(root.join("alias/a"))
+        );
+    }
+
+    #[test]
+    fn moving_a_folder_into_itself_moves_nothing() {
+        let (_d, root) = setup();
+        fs::create_dir_all(root.join("pinA/sub")).unwrap();
+        fs::write(root.join("five.txt"), b"5").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+        // The file comes first, so a per-item check would move it before
+        // failing on the folder.
+        let r = transfer(
+            OpKind::Move,
+            &[root.join("alias/five.txt"), root.join("alias/pinA")],
+            &root.join("pinA/sub"),
+            Conflict::KeepBoth,
+            &Progress::default(),
+        );
+        assert!(r.is_err());
+        assert!(root.join("five.txt").exists());
+        assert!(!root.join("pinA/sub/five.txt").exists());
     }
 
     #[test]

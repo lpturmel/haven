@@ -864,17 +864,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Dropping a folder onto itself (its tab, sidebar row or crumb) is
-        // a no-op, not an error.
-        if paths.contains(&dest) {
-            return;
-        }
-        let kind = if copy || !same_volume(&paths, &dest) {
-            OpKind::Copy
-        } else {
-            OpKind::Move
-        };
-        self.start_transfer(kind, paths, dest, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let plan = cx
+                .background_executor()
+                .spawn(async move { plan_drop(paths, dest, copy) })
+                .await;
+            if let Some((kind, paths, dest)) = plan {
+                let _ = this.update_in(cx, |ws, window, cx| {
+                    ws.start_transfer(kind, paths, dest, window, cx)
+                });
+            }
+        })
+        .detach();
     }
 
     pub fn start_transfer(
@@ -1428,6 +1429,27 @@ impl Focusable for Workspace {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
     }
+}
+
+/// What a drop of `paths` onto `dest` should do, or `None` to ignore it.
+/// Dropping a folder onto itself or onto a folder inside it (its tab, a
+/// sidebar row, a crumb, a row in its own listing) does nothing, whichever
+/// way either path is spelled. Touches the filesystem: run it off the UI
+/// thread.
+fn plan_drop(
+    paths: Vec<PathBuf>,
+    dest: PathBuf,
+    copy: bool,
+) -> Option<(OpKind, Vec<PathBuf>, PathBuf)> {
+    if paths.is_empty() || ops::source_containing(&paths, &dest).is_some() {
+        return None;
+    }
+    let kind = if copy || !same_volume(&paths, &dest) {
+        OpKind::Copy
+    } else {
+        OpKind::Move
+    };
+    Some((kind, paths, dest))
 }
 
 fn same_volume(paths: &[PathBuf], dest: &Path) -> bool {
@@ -2120,6 +2142,48 @@ mod tests {
         // there copy instead of deleting the originals.
         assert!(same_volume(&[root.join("b.txt")], &root.join("dst")));
         assert!(!same_volume(&[root.join("b.txt")], Path::new("/dev")));
+    }
+
+    #[gpui::test]
+    async fn drops_into_a_dragged_folder_do_nothing(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        std::fs::create_dir_all(root.join("pinA/sub")).unwrap();
+        std::fs::write(root.join("five.txt"), b"5").unwrap();
+        // `alias` plays `/tmp`, `root` plays `/private/tmp`.
+        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+        let alias = root.join("alias");
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        ws.update_in(cx, |ws, window, cx| {
+            // Onto a folder inside a dragged one, the file first.
+            ws.drop_files(
+                vec![alias.join("five.txt"), alias.join("pinA")],
+                root.join("pinA/sub"),
+                false,
+                window,
+                cx,
+            );
+            // Onto the dragged folder itself, spelled differently.
+            ws.drop_files(
+                vec![alias.join("pinA")],
+                root.join("pinA"),
+                true,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(root.join("five.txt").exists());
+        assert!(!root.join("pinA/sub/five.txt").exists());
+        assert!(!root.join("pinA/sub/pinA").exists() && !root.join("pinA/pinA").exists());
+        // Ignored silently: no job, no error toast, no conflict dialog.
+        ws.update(cx, |ws, _| {
+            assert!(ws.jobs.is_empty() && ws.toast.is_none() && ws.overlay.is_none());
+        });
+        assert_eq!(
+            plan_drop(vec![alias.join("five.txt")], root.join("pinA"), false).map(|p| p.0),
+            Some(OpKind::Move)
+        );
     }
 
     #[gpui::test]
