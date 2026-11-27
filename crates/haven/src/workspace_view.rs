@@ -883,9 +883,12 @@ impl Workspace {
                     .cursor_pointer()
                     .tooltip(move |_, cx| crate::ui::tooltip(tip.clone(), cx))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(
-                        cx.listener(move |ws, _, window, cx| ws.navigate_to(&target, window, cx)),
-                    )
+                    .on_click(cx.listener({
+                        let target = target.clone();
+                        move |ws, _, window, cx| ws.navigate_to(&target, window, cx)
+                    }))
+                    // Drops land in the folder "…" opens, like any crumb.
+                    .map(|d| crumb_drop_target(d, target, t.selection, cx))
                     .child("…")
                     .into_any_element(),
             );
@@ -923,12 +926,7 @@ impl Workspace {
                         let a = a.clone();
                         move |ws, _, window, cx| ws.navigate_to(&a, window, cx)
                     }))
-                    .map(|d| {
-                        let a = a.clone();
-                        file_drop_target(d, t.selection, cx, move |ws, dropped, window, cx| {
-                            ws.drop_files(dropped.paths, a.clone(), dropped.copy, window, cx)
-                        })
-                    })
+                    .map(|d| crumb_drop_target(d, a.clone(), t.selection, cx))
                     .children(icon_el.map(|img| gpui::img(img).flex_none().size(px(CRUMB_ICON))))
                     .child(div().min_w_0().ellipsis().child(label))
                     .into_any_element(),
@@ -1461,4 +1459,17 @@ impl Render for Workspace {
             .children(overlay)
             .children(menu)
     }
+}
+
+/// Makes a path-bar crumb accept files dragged onto it (from Haven or other
+/// apps), dropping them into `dest`. Shared by every crumb, "…" included.
+fn crumb_drop_target<E: InteractiveElement>(
+    el: E,
+    dest: PathBuf,
+    highlight: gpui::Hsla,
+    cx: &Context<Workspace>,
+) -> E {
+    file_drop_target(el, highlight, cx, move |ws, dropped, window, cx| {
+        ws.drop_files(dropped.paths, dest.clone(), dropped.copy, window, cx)
+    })
 }
