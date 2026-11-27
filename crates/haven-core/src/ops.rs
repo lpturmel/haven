@@ -516,6 +516,9 @@ pub fn transfer(
                                 "cannot replace a folder with itself",
                             ));
                         }
+                        // The source may have gone since the conflict dialog
+                        // was queued: fail before trashing what it would replace.
+                        fs::symlink_metadata(src)?;
                         let landed = haven_macos::trash(&target).map_err(io::Error::other)?;
                         replaced.push((target.clone(), landed));
                     }
@@ -997,6 +1000,23 @@ mod tests {
         assert!(r.is_err());
         assert!(root.join("five.txt").exists());
         assert!(!root.join("pinA/sub/five.txt").exists());
+    }
+
+    #[test]
+    fn replace_with_a_vanished_source_trashes_nothing() {
+        let (_d, root) = setup();
+        fs::create_dir(root.join("dst")).unwrap();
+        fs::write(root.join("dst/a.txt"), b"keep").unwrap();
+        // `a.txt` was moved away after the conflict dialog was queued.
+        let r = transfer(
+            OpKind::Move,
+            &[root.join("a.txt")],
+            &root.join("dst"),
+            Conflict::Replace,
+            &Progress::default(),
+        );
+        assert!(r.is_err());
+        assert_eq!(fs::read(root.join("dst/a.txt")).unwrap(), b"keep");
     }
 
     #[test]
