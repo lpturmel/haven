@@ -396,6 +396,11 @@ fn item_id(path: &Path) -> Option<FileId> {
 }
 
 /// Whether `a` and `b` name the same item (a symlink is itself).
+///
+/// Two hard links to one file count as the same item. So moving a file onto
+/// a same-name hard link of itself in the destination does nothing and
+/// leaves both names, which is what rename(2) itself does for links to the
+/// same file (POSIX).
 fn same_item(a: &Path, b: &Path) -> bool {
     a == b || matches!((item_id(a), item_id(b)), (Some(x), Some(y)) if x == y)
 }
@@ -1439,6 +1444,54 @@ mod tests {
             assert!(out.is_err(), "{a:?} -> {b:?}");
             assert_eq!(fs::read(sp[1].join("x/a/a/keep.txt")).unwrap(), b"k");
         }
+    }
+
+    #[test]
+    fn already_in_compares_the_parent_folder_by_identity() {
+        let (_d, sp) = tmp_spellings();
+        fs::create_dir_all(sp[1].join("x")).unwrap();
+        fs::create_dir_all(sp[1].join("y")).unwrap();
+        fs::write(sp[1].join("x/a.txt"), b"a").unwrap();
+        fs::write(sp[1].join("x/b.txt"), b"b").unwrap();
+        fs::write(sp[1].join("y/c.txt"), b"c").unwrap();
+        for (a, b) in spelling_pairs(&sp) {
+            let x = b.join("x");
+            assert!(
+                already_in(&[a.join("x/a.txt"), a.join("x/b.txt")], &x),
+                "{a:?} -> {b:?}"
+            );
+            // One item elsewhere: the move does something.
+            assert!(!already_in(&[a.join("x/a.txt"), a.join("y/c.txt")], &x));
+            // The folder itself isn't "in" itself.
+            assert!(!already_in(&[a.join("x")], &x));
+        }
+        assert!(!already_in(&[], &sp[1].join("x")), "nothing to move");
+        assert!(!already_in(
+            &[sp[1].join("x/a.txt")],
+            &sp[1].join("missing")
+        ));
+    }
+
+    /// A same-name hard link in the destination is the same file: the move
+    /// does nothing and both names stay, like rename(2) itself.
+    #[test]
+    fn move_onto_a_hard_link_of_itself_does_nothing() {
+        let (_d, root) = setup();
+        fs::create_dir_all(root.join("x")).unwrap();
+        fs::create_dir_all(root.join("y")).unwrap();
+        fs::write(root.join("x/a.txt"), b"a").unwrap();
+        fs::hard_link(root.join("x/a.txt"), root.join("y/a.txt")).unwrap();
+        assert!(conflicts(&[root.join("x/a.txt")], &root.join("y")).is_empty());
+        transfer(
+            OpKind::Move,
+            &[root.join("x/a.txt")],
+            &root.join("y"),
+            Conflict::KeepBoth,
+            &Progress::default(),
+        )
+        .unwrap();
+        assert!(root.join("x/a.txt").exists() && root.join("y/a.txt").exists());
+        assert!(!root.join("y/a copy.txt").exists());
     }
 
     #[test]

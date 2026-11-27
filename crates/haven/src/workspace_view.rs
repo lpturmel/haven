@@ -1099,6 +1099,11 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A dialog queued by background work shows once the open one closes,
+        // however it closed. Deferred: not mutating state mid-render.
+        if self.overlay.is_none() && self.context_menu.is_none() && self.has_queued_overlay() {
+            cx.defer_in(window, |ws, window, cx| ws.show_queued_overlay(window, cx));
+        }
         let t = theme(cx).clone();
         let sidebar = self.sidebar_visible.then(|| self.render_sidebar(cx));
         let tab_strip = self.render_tab_strip(cx);
