@@ -8,7 +8,7 @@
 # state dir, and captures the on-screen window (so the frosted sidebar is shown
 # composited over the real desktop) for each scenario:
 #
-#   start.png    start page (pinned / drives / recents)
+#   start.png    start page (pinned fixture folders / drives / recents)
 #   list.png     list view   — columns must line up under their headers
 #   grid.png     grid view (includes a HEIC photo thumbnail)
 #   columns.png  Miller columns
@@ -79,8 +79,14 @@ trap 'for p in $(pgrep -f "${EXE}"); do quit_ours "${p}"; done' EXIT
 capture() {
     local name="$1" view="$2"
     shift 2
-    printf '{"default_view":"%s","session":{"tabs":[null],"active":0}}\n' "${view}" \
-        >"${STATE}/state.json"
+    # Pin the fixture's folders on the start page instead of the default
+    # ~/Desktop, ~/Documents and ~/Downloads. Those are privacy-protected, and
+    # the first launch of a freshly built (ad-hoc signed) bundle can take
+    # seconds to stat them while macOS evaluates the new signature, so
+    # start.png raced the pins and showed the empty placeholder. Fixture pins
+    # load at once and keep the owner's folders out of the captures.
+    printf '{"default_view":"%s","start_pins":["%s/docs","%s/src","%s/assets"],"session":{"tabs":[null],"active":0}}\n' \
+        "${view}" "${FIXTURE}" "${FIXTURE}" "${FIXTURE}" >"${STATE}/state.json"
     open -n --env "HAVEN_STATE_DIR=${STATE}" "${APP}" --args "$@"
     local pid=""
     for _ in $(seq 1 50); do
