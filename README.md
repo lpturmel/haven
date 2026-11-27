@@ -27,6 +27,9 @@ cp -R target/bundle/Haven.app /Applications/
 scripts/haven ~/some/folder         # CLI shim (put it on your PATH)
 ```
 
+The bundle uses `assets/AppIcon.icns` for Finder and the Dock. The transparent
+1024×1024 master is `assets/AppIcon.png`; update both files when changing the icon.
+
 ## Test
 
 ```bash
