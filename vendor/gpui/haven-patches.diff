@@ -1,0 +1,309 @@
+diff
+--- a/src/interactive.rs	2006-07-23 21:21:28
++++ b/src/interactive.rs	2026-11-26 22:31:54
+@@ -503,6 +503,22 @@
+     }
+ }
+ 
++/// HAVEN PATCH: whether the source of the current (or last) external file
++/// drag allows moving its files. Apps that hand out their own data (editor
++/// file trees, attachment caches) usually allow only copying; Finder allows
++/// both. See vendor/gpui/HAVEN_PATCHES.md.
++static EXTERNAL_DRAG_ALLOWS_MOVE: std::sync::atomic::AtomicBool =
++    std::sync::atomic::AtomicBool::new(false);
++
++/// See [`EXTERNAL_DRAG_ALLOWS_MOVE`].
++pub fn external_drag_allows_move() -> bool {
++    EXTERNAL_DRAG_ALLOWS_MOVE.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++pub(crate) fn set_external_drag_allows_move(allows: bool) {
++    EXTERNAL_DRAG_ALLOWS_MOVE.store(allows, std::sync::atomic::Ordering::Relaxed);
++}
++
+ impl Render for ExternalPaths {
+     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+         // the platform will render icons for the dragged files
+diff
+--- a/src/platform/mac/text_system.rs	2006-07-23 21:21:28
++++ b/src/platform/mac/text_system.rs	2026-11-26 22:07:23
+@@ -18,6 +18,7 @@
+     color_space::CGColorSpace,
+     context::{CGContext, CGTextDrawingMode},
+     display::CGPoint,
++    geometry::{CGRect, CGSize},
+ };
+ use core_text::{
+     font::CTFont,
+@@ -49,7 +50,22 @@
+ 
+ #[allow(non_upper_case_globals)]
+ const kCGImageAlphaOnly: u32 = 7;
++#[allow(non_upper_case_globals)]
++const kCGImageAlphaNoneSkipLast: u32 = 5;
+ 
++/// HAVEN PATCH: font smoothing applies to monochrome glyphs only.
++fn smoothing_applies(params: &RenderGlyphParams) -> bool {
++    !params.is_emoji && params.smoothing
++}
++
++/// HAVEN PATCH: coverage from a white-on-black RGBX bitmap (the brightest
++/// channel, so any colour fringing still counts as ink).
++fn smoothed_rgb_to_alpha(rgbx: &[u8]) -> Vec<u8> {
++    rgbx.chunks_exact(4)
++        .map(|p| p[0].max(p[1]).max(p[2]))
++        .collect()
++}
++
+ pub(crate) struct MacTextSystem(RwLock<MacTextSystemState>);
+ 
+ #[derive(Clone, PartialEq, Eq, Hash)]
+@@ -330,7 +346,7 @@
+     fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+         let font = &self.fonts[params.font_id.0];
+         let scale = Transform2F::from_scale(params.scale_factor);
+-        Ok(font
++        let bounds: Bounds<DevicePixels> = font
+             .raster_bounds(
+                 params.glyph_id.0,
+                 params.font_size.into(),
+@@ -338,7 +354,17 @@
+                 HintingOptions::None,
+                 font_kit::canvas::RasterizationOptions::GrayscaleAa,
+             )?
+-            .into())
++            .into();
++        // HAVEN PATCH: font smoothing dilates glyphs past their outline, so
++        // leave a pixel of room on every side.
++        if smoothing_applies(params) && bounds.size.width.0 > 0 && bounds.size.height.0 > 0 {
++            Ok(Bounds {
++                origin: point(bounds.origin.x - DevicePixels(1), bounds.origin.y - DevicePixels(1)),
++                size: size(bounds.size.width + DevicePixels(2), bounds.size.height + DevicePixels(2)),
++            })
++        } else {
++            Ok(bounds)
++        }
+     }
+ 
+     fn rasterize_glyph(
+@@ -359,6 +385,7 @@
+             }
+             let bitmap_size = bitmap_size;
+ 
++            let smooth = smoothing_applies(params);
+             let mut bytes;
+             let cx;
+             if params.is_emoji {
+@@ -372,6 +399,28 @@
+                     &CGColorSpace::create_device_rgb(),
+                     kCGImageAlphaPremultipliedLast,
+                 );
++            } else if smooth {
++                // HAVEN PATCH: CoreText only applies font smoothing in an
++                // opaque RGB context: draw white on black, then use the
++                // brightest channel as coverage (see below).
++                bytes = vec![0; bitmap_size.width.0 as usize * 4 * bitmap_size.height.0 as usize];
++                cx = CGContext::create_bitmap_context(
++                    Some(bytes.as_mut_ptr() as *mut _),
++                    bitmap_size.width.0 as usize,
++                    bitmap_size.height.0 as usize,
++                    8,
++                    bitmap_size.width.0 as usize * 4,
++                    &CGColorSpace::create_device_rgb(),
++                    kCGImageAlphaNoneSkipLast,
++                );
++                cx.set_rgb_fill_color(0.0, 0.0, 0.0, 1.0);
++                cx.fill_rect(CGRect::new(
++                    &CGPoint::new(0.0, 0.0),
++                    &CGSize::new(
++                        bitmap_size.width.0 as CGFloat,
++                        bitmap_size.height.0 as CGFloat,
++                    ),
++                ));
+             } else {
+                 bytes = vec![0; bitmap_size.width.0 as usize * bitmap_size.height.0 as usize];
+                 cx = CGContext::create_bitmap_context(
+@@ -400,7 +449,13 @@
+                 .subpixel_variant
+                 .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
+             cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFill);
+-            cx.set_gray_fill_color(0.0, 1.0);
++            if smooth {
++                cx.set_rgb_fill_color(1.0, 1.0, 1.0, 1.0);
++                cx.set_allows_font_smoothing(true);
++                cx.set_should_smooth_fonts(true);
++            } else {
++                cx.set_gray_fill_color(0.0, 1.0);
++            }
+             cx.set_allows_antialiasing(true);
+             cx.set_should_antialias(true);
+             cx.set_allows_font_subpixel_positioning(true);
+@@ -424,6 +479,9 @@
+                 for pixel in bytes.chunks_exact_mut(4) {
+                     swap_rgba_pa_to_bgra(pixel);
+                 }
++            } else if smooth {
++                // HAVEN PATCH: white-on-black RGB → single-channel coverage.
++                bytes = smoothed_rgb_to_alpha(&bytes);
+             }
+ 
+             Ok((bitmap_size, bytes))
+diff
+--- a/src/platform/mac/window.rs	2006-07-23 21:21:28
++++ b/src/platform/mac/window.rs	2026-11-26 22:31:54
+@@ -1875,6 +1875,16 @@
+                 lock.synthetic_drag_counter += 1;
+             }
+ 
++            // HAVEN PATCH: a native drag session (files dragged out of the
++            // window) swallows the mouse-up, so also stop replaying the
++            // synthetic drag as soon as the mouse moves with no button held.
++            PlatformInput::MouseMove(MouseMoveEvent {
++                pressed_button: None,
++                ..
++            }) => {
++                lock.synthetic_drag_counter += 1;
++            }
++
+             PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                 modifiers,
+                 capslock,
+@@ -2371,11 +2381,30 @@
+         && send_new_event(&window_state, event)
+     {
+         window_state.lock().external_files_dragged = true;
+-        return NSDragOperationCopy;
++        return drag_operation(dragging_info);
+     }
+     NSDragOperationNone
+ }
+ 
++/// HAVEN PATCH: records whether the drag source allows moving, and returns
++/// the operation the drop will most likely perform so the cursor badge is
++/// honest: a move (no badge) when the source allows it and ⌥ isn't held,
++/// else a copy ("+"). The app still decides per destination (copy across
++/// volumes).
++fn drag_operation(dragging_info: id) -> NSDragOperation {
++    const MOVE: NSDragOperation = 16;
++    const OPTION: u64 = 1 << 19;
++    let mask: NSDragOperation = unsafe { msg_send![dragging_info, draggingSourceOperationMask] };
++    let flags: u64 = unsafe { msg_send![class!(NSEvent), modifierFlags] };
++    let allows_move = mask & MOVE != 0;
++    crate::set_external_drag_allows_move(allows_move);
++    if allows_move && flags & OPTION == 0 {
++        MOVE
++    } else {
++        NSDragOperationCopy
++    }
++}
++
+ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
+     let window_state = unsafe { get_window_state(this) };
+     let position = drag_event_position(&window_state, dragging_info);
+@@ -2383,7 +2412,7 @@
+         &window_state,
+         PlatformInput::FileDrop(FileDropEvent::Pending { position }),
+     ) {
+-        NSDragOperationCopy
++        drag_operation(dragging_info)
+     } else {
+         NSDragOperationNone
+     }
+@@ -2400,6 +2429,7 @@
+ 
+ extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -> BOOL {
+     let window_state = unsafe { get_window_state(this) };
++    drag_operation(dragging_info);
+     let position = drag_event_position(&window_state, dragging_info);
+     send_new_event(
+         &window_state,
+@@ -2442,6 +2472,13 @@
+         Timer::after(Duration::from_millis(16)).await;
+         if let Some(window_state) = window_state.upgrade() {
+             let mut lock = window_state.lock();
++            // HAVEN PATCH: a native drag session may have eaten the mouse-up
++            // (and the cursor may never come back over this window): stop
++            // replaying as soon as no mouse button is actually held.
++            let pressed: NSUInteger = unsafe { msg_send![class!(NSEvent), pressedMouseButtons] };
++            if pressed == 0 {
++                lock.synthetic_drag_counter += 1;
++            }
+             if lock.synthetic_drag_counter == drag_id {
+                 if let Some(mut callback) = lock.event_callback.take() {
+                     drop(lock);
+diff
+--- a/src/taffy.rs	2006-07-23 21:21:28
++++ b/src/taffy.rs	2026-11-26 22:07:23
+@@ -309,7 +309,7 @@
+             unit: &Option<u16>,
+         ) -> Vec<taffy::GridTemplateComponent<T>> {
+             // grid-template-columns: repeat(<number>, minmax(0, 1fr));
+-            unit.map(|count| vec![repeat(count, vec![minmax(length(0.0), fr(1.0))])])
++            unit.map(|count| vec![repeat(count, vec![minmax(length(0.0_f32), fr(1.0_f32))])])
+                 .unwrap_or_default()
+         }
+ 
+diff
+--- a/src/text_system.rs	2006-07-23 21:21:28
++++ b/src/text_system.rs	2026-11-26 22:35:56
+@@ -767,6 +767,9 @@
+     pub(crate) subpixel_variant: Point<u8>,
+     pub(crate) scale_factor: f32,
+     pub(crate) is_emoji: bool,
++    /// HAVEN PATCH: rasterize with font smoothing (part of the cache key, so
++    /// toggling it re-rasterizes instead of reusing atlas glyphs).
++    pub(crate) smoothing: bool,
+ }
+ 
+ impl Eq for RenderGlyphParams {}
+@@ -779,6 +782,7 @@
+         self.subpixel_variant.hash(state);
+         self.scale_factor.to_bits().hash(state);
+         self.is_emoji.hash(state);
++        self.smoothing.hash(state);
+     }
+ }
+ 
+@@ -902,6 +906,23 @@
+     pub fn bounding_box(&self, font_size: Pixels) -> Bounds<Pixels> {
+         (self.bounding_box / self.units_per_em as f32 * font_size.0).map(px)
+     }
++}
++
++/// Whether glyphs are rasterized with font smoothing (CoreText's "stem
++/// darkening", which native macOS text uses). Without it gpui's text is
++/// thinner and softer than AppKit's, most visibly on non-Retina displays.
++/// HAVEN PATCH: see vendor/gpui/HAVEN_PATCHES.md.
++static FONT_SMOOTHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
++
++/// Enables or disables font smoothing. Takes effect on the next frame
++/// (refresh open windows to repaint).
++pub fn set_font_smoothing(enabled: bool) {
++    FONT_SMOOTHING.store(enabled, std::sync::atomic::Ordering::Relaxed);
++}
++
++/// Whether font smoothing is enabled (see [`set_font_smoothing`]).
++pub fn font_smoothing() -> bool {
++    FONT_SMOOTHING.load(std::sync::atomic::Ordering::Relaxed)
+ }
+ 
+ #[allow(unused)]
+diff
+--- a/src/window.rs	2006-07-23 21:21:28
++++ b/src/window.rs	2026-11-26 22:07:23
+@@ -2970,6 +2970,7 @@
+             subpixel_variant,
+             scale_factor,
+             is_emoji: false,
++            smoothing: crate::font_smoothing(),
+         };
+ 
+         let raster_bounds = self.text_system().raster_bounds(&params)?;
+@@ -3026,6 +3027,7 @@
+             subpixel_variant: Default::default(),
+             scale_factor,
+             is_emoji: true,
++            smoothing: false,
+         };
+ 
+         let raster_bounds = self.text_system().raster_bounds(&params)?;

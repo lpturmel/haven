@@ -62,6 +62,12 @@ pub struct Workspace {
     tag_tx: smol::channel::Sender<(Vec<PathBuf>, Tag, bool)>,
     pub toast: Option<Toast>,
     pub sidebar_visible: bool,
+    /// Volumes being ejected right now (their eject buttons show a spinner).
+    pub ejecting: HashSet<PathBuf>,
+    /// Last seen `show_hidden` / `preview_visible`, to react when Settings
+    /// flips them from another window.
+    seen_show_hidden: bool,
+    seen_preview_visible: bool,
     watcher: Option<DirWatcher>,
     overlay_subs: Vec<Subscription>,
     _subs: Vec<Subscription>,
@@ -79,7 +85,29 @@ impl Workspace {
         let mut subs = vec![
             cx.subscribe_in(&path_field, window, Self::on_path_event),
             cx.subscribe_in(&filter_field, window, Self::on_filter_event),
-            cx.observe_global::<Store>(|_, cx| cx.notify()),
+            cx.observe_global::<Store>(|ws, cx| {
+                // Settings can flip "show hidden files" from another window.
+                let hidden = Store::get(cx).show_hidden;
+                if hidden != ws.seen_show_hidden {
+                    ws.seen_show_hidden = hidden;
+                    for tab in ws.tabs.clone() {
+                        tab.update(cx, |t, cx| {
+                            t.column_cache.clear();
+                            t.reload(cx)
+                        });
+                    }
+                }
+                // The preview isn't kept up to date while hidden: rebuild it
+                // for the current selection when it comes back.
+                let preview = Store::get(cx).preview_visible;
+                if preview != ws.seen_preview_visible {
+                    ws.seen_preview_visible = preview;
+                    for tab in ws.tabs.clone() {
+                        tab.update(cx, |t, cx| t.invalidate_preview(cx));
+                    }
+                }
+                cx.notify()
+            }),
             cx.observe_global::<StartData>(|this, cx| {
                 for tab in &this.tabs {
                     tab.update(cx, |_, cx| cx.notify());
@@ -160,6 +188,9 @@ impl Workspace {
             tag_tx,
             toast: None,
             sidebar_visible: true,
+            ejecting: HashSet::new(),
+            seen_show_hidden: Store::get(cx).show_hidden,
+            seen_preview_visible: Store::get(cx).preview_visible,
             watcher,
             overlay_subs: Vec::new(),
             _subs: Vec::new(),
@@ -648,6 +679,109 @@ impl Workspace {
         }
     }
 
+    /// Ejects the volume mounted at `mount`. Plans first (in the background):
+    /// when other volumes share its disk, asks before taking them too, like
+    /// Finder. `confirmed` skips that question.
+    pub fn eject(&mut self, mount: PathBuf, confirmed: bool, cx: &mut Context<Self>) {
+        if !self.ejecting.insert(mount.clone()) {
+            return;
+        }
+        cx.notify();
+        let m = mount.clone();
+        let plan = cx
+            .background_executor()
+            .spawn(async move { volumes::eject_plan(&m) });
+        cx.spawn(async move |this, cx| {
+            let plan = plan.await;
+            let _ = this.update(cx, |ws, cx| {
+                if plan.siblings.is_empty() || confirmed {
+                    ws.run_eject(plan, cx);
+                } else {
+                    ws.ejecting.remove(&mount);
+                    let others: Vec<String> =
+                        plan.siblings.iter().map(|p| volume_name(p)).collect();
+                    ws.overlay = Some(Overlay::Confirm {
+                        title: format!(
+                            "Eject “{}” and the other volumes on its disk?",
+                            volume_name(&mount)
+                        ),
+                        body: format!(
+                            "“{}” is on the same disk, so it will be ejected too.",
+                            others.join("”, “")
+                        ),
+                        confirm: "Eject All".into(),
+                        action: Box::new(crate::actions::EjectVolumeConfirmed(mount.clone())),
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Carries out a planned eject. Tabs showing any affected volume go to
+    /// the start page first: a listing, watcher or size scan still open on it
+    /// would keep it busy and make the eject fail.
+    fn run_eject(&mut self, plan: volumes::EjectPlan, cx: &mut Context<Self>) {
+        let mount = plan.mount.clone();
+        let name = volume_name(&mount);
+        let affected: Vec<PathBuf> = std::iter::once(mount.clone())
+            .chain(plan.siblings.iter().cloned())
+            .collect();
+        for tab in self.tabs.clone() {
+            let on_volume = {
+                let t = tab.read(cx);
+                affected.iter().any(|m| {
+                    t.dir().is_some_and(|d| d.starts_with(m))
+                        || t.column_root.as_ref().is_some_and(|r| r.starts_with(m))
+                })
+            };
+            if on_volume {
+                tab.update(cx, |t, cx| {
+                    t.column_root = None;
+                    t.navigate(Location::Start, false, cx)
+                });
+            }
+        }
+        // (Navigating emits `Navigated`, which unwatches the old folders.)
+        self.show_toast(format!("Ejecting “{name}”…"), false, cx);
+        let task = cx
+            .background_executor()
+            .spawn(async move { volumes::eject(&plan) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |ws, cx| {
+                ws.ejecting.remove(&mount);
+                match result {
+                    Ok(volumes::EjectOutcome::Ejected) => {
+                        ws.show_toast(format!("“{name}” can be safely removed"), false, cx)
+                    }
+                    Ok(volumes::EjectOutcome::Unmounted) => {
+                        ws.show_toast(format!("“{name}” was unmounted"), false, cx)
+                    }
+                    Err(e) => ws.show_toast(format!("Couldn't eject “{name}”: {e}"), true, cx),
+                }
+                refresh_start_data(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// ⌘E: ejects the volume of the selected drive, or of the current folder.
+    pub fn eject_current(&mut self, cx: &mut Context<Self>) {
+        let vols = cx.global::<StartData>().volumes.clone();
+        let tab = self.active_tab().read(cx);
+        let target = tab
+            .selected_paths()
+            .into_iter()
+            .chain(tab.dir().map(Path::to_path_buf))
+            .find_map(|p| volumes::ejectable_volume_for(&p, &vols).map(|v| v.mount.clone()));
+        match target {
+            Some(mount) => self.eject(mount, false, cx),
+            None => self.show_toast("Nothing to eject here", false, cx),
+        }
+    }
+
     pub fn show_toast(&mut self, message: impl Into<String>, error: bool, cx: &mut Context<Self>) {
         self.toast = Some(Toast {
             message: message.into(),
@@ -730,6 +864,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Dropping a folder onto itself (its tab, sidebar row or crumb) is
+        // a no-op, not an error.
+        if paths.contains(&dest) {
+            return;
+        }
         let kind = if copy || !same_volume(&paths, &dest) {
             OpKind::Copy
         } else {
@@ -1315,6 +1454,13 @@ pub fn wait_for_tag_writes() {
     {
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn volume_name(mount: &Path) -> String {
+    mount
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| mount.display().to_string())
 }
 
 pub fn refresh_start_data(cx: &mut App) {
@@ -1974,5 +2120,110 @@ mod tests {
         // there copy instead of deleting the originals.
         assert!(same_volume(&[root.join("b.txt")], &root.join("dst")));
         assert!(!same_volume(&[root.join("b.txt")], Path::new("/dev")));
+    }
+
+    #[gpui::test]
+    async fn eject_moves_tabs_off_the_volume(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let other = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.join("projects")));
+        ws.update_in(cx, |ws, window, cx| {
+            ws.add_tab(Location::Dir(other.clone()), false, window, cx);
+            // `root` stands in for a mounted volume (not a real mount point,
+            // so no diskutil call is made).
+            ws.eject(root.clone(), false, cx);
+            assert!(ws.ejecting.contains(&root));
+            // A second request while one is running is ignored.
+            ws.eject(root.clone(), false, cx);
+        });
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, cx| {
+            assert_eq!(ws.tabs[0].read(cx).location, Location::Start);
+            assert_eq!(ws.tabs[1].read(cx).dir(), Some(other.as_path()));
+            assert!(ws.ejecting.is_empty());
+            let toast = ws.toast.as_ref().expect("result toast");
+            assert!(!toast.error, "{}", toast.message);
+            assert!(
+                toast.message.contains("safely removed"),
+                "{}",
+                toast.message
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn eject_shortcut_without_a_volume_says_so(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        ws.update_in(cx, |ws, _, cx| ws.eject_current(cx));
+        ws.read_with(cx, |ws, cx| {
+            assert!(ws.ejecting.is_empty());
+            assert_eq!(ws.active_tab().read(cx).dir(), Some(root.as_path()));
+            assert_eq!(
+                ws.toast.as_ref().map(|t| t.message.as_str()),
+                Some("Nothing to eject here")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn settings_toggling_hidden_files_reloads_tabs(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        std::fs::write(root.join(".secret"), b"x").unwrap();
+        cx.update(|cx| Store::update(cx, |s| s.show_hidden = false));
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        let names = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            ws.read_with(cx, |ws, cx| {
+                ws.active_tab()
+                    .read(cx)
+                    .entries
+                    .iter()
+                    .map(|e| e.name.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(!names(&ws, cx).contains(&".secret".to_string()));
+        // What the Settings window does: write the store, nothing else.
+        cx.update(|_, cx| Store::update(cx, |s| s.show_hidden = true));
+        cx.run_until_parked();
+        assert!(names(&ws, cx).contains(&".secret".to_string()));
+        cx.update(|_, cx| Store::update(cx, |s| s.show_hidden = false));
+        cx.run_until_parked();
+        assert!(!names(&ws, cx).contains(&".secret".to_string()));
+    }
+
+    #[gpui::test]
+    async fn settings_showing_the_preview_rebuilds_it(cx: &mut TestAppContext) {
+        use crate::tab::Preview;
+        init(cx);
+        let root = fixture();
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        cx.update(|cx| Store::update(cx, |s| s.preview_visible = true));
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        let tab = ws.read_with(cx, |ws, _| ws.active_tab().clone());
+        let ix = |name: &str, cx: &mut VisualTestContext| {
+            tab.read_with(cx, |t, _| {
+                t.entries.iter().position(|e| e.name == name).unwrap()
+            })
+        };
+        let (a, projects) = (ix("a.txt", cx), ix("projects", cx));
+        tab.update(cx, |t, cx| t.select_only(a, cx));
+        cx.run_until_parked();
+        // Hide the preview the way Settings does, change the selection,
+        // then show it again: it must follow the new selection.
+        cx.update(|_, cx| Store::update(cx, |s| s.preview_visible = false));
+        cx.run_until_parked();
+        tab.update(cx, |t, cx| t.select_only(projects, cx));
+        cx.run_until_parked();
+        cx.update(|_, cx| Store::update(cx, |s| s.preview_visible = true));
+        cx.run_until_parked();
+        tab.read_with(cx, |t, _| match &t.preview {
+            Preview::Folder { entry, .. } => assert_eq!(entry.name, "projects"),
+            Preview::Text(p) => panic!("stale preview of {}", p.path.display()),
+            _ => panic!("expected the folder preview"),
+        });
     }
 }

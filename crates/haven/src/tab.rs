@@ -136,6 +136,9 @@ pub struct Tab {
     size_control: Option<Arc<Control>>,
     pub sizing: bool,
     pub grid_cols: usize,
+    /// Width of the list view's body, measured each frame; decides which
+    /// optional columns fit (see `views::list::Columns`).
+    pub list_width: f32,
 }
 
 impl EventEmitter<TabEvent> for Tab {}
@@ -177,6 +180,7 @@ impl Tab {
             size_control: None,
             sizing: false,
             grid_cols: 1,
+            list_width: 0.,
         };
         tab.navigate(location, false, cx);
         tab
@@ -887,12 +891,14 @@ impl Tab {
     pub fn drop_on(
         &mut self,
         dest: PathBuf,
-        paths: Vec<PathBuf>,
-        window: &Window,
+        dropped: crate::views::Dropped,
         cx: &mut Context<Self>,
     ) {
-        let copy = window.modifiers().alt;
-        cx.emit(TabEvent::Drop { paths, dest, copy });
+        cx.emit(TabEvent::Drop {
+            paths: dropped.paths,
+            dest,
+            copy: dropped.copy,
+        });
     }
 
     // ---------------------------------------------------------------- columns

@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, AppContext, Context, DragMoveEvent, Empty, ExternalPaths, FontWeight,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, deferred, div,
-    prelude::FluentBuilder, px, relative,
+    AnyElement, AppContext, Context, DragMoveEvent, Empty, FontWeight, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, deferred, div, prelude::FluentBuilder, px,
+    relative,
 };
 use haven_core::state::ViewMode;
 use haven_core::{TagColor, fmt, home_dir};
@@ -19,6 +19,7 @@ use crate::tab::{DraggedFiles, Location};
 use crate::theme::{UI_FONT, theme};
 use crate::ui::Ellipsis as _;
 use crate::ui::{icon, icon_button, section_label, tag_dot};
+use crate::views::file_drop_target;
 use crate::views::start::start_data;
 use crate::workspace::Workspace;
 
@@ -108,7 +109,7 @@ impl Workspace {
             .text_color(t.text)
             .cursor_pointer()
             .when(active, |d| d.bg(t.active))
-            .when(!active, |d| d.hover(|s| s.bg(t.hover)))
+            .when(!active, |d| d.hover(|s| s.bg(t.sidebar_hover)))
             .child(icon(icon_name).size(px(15.)).text_color(if active {
                 t.accent_text
             } else {
@@ -117,7 +118,7 @@ impl Workspace {
             .child(div().flex_1().min_w_0().ellipsis().child(label));
         match path {
             Some(path) => {
-                let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
+                let (p1, p2) = (path.clone(), path.clone());
                 row.on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, window, cx| {
                     if ev.modifiers().platform {
                         ws.add_tab(Location::Dir(p1.clone()), true, window, cx);
@@ -125,22 +126,11 @@ impl Workspace {
                         ws.navigate_to(&p1, window, cx);
                     }
                 }))
-                .drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(t.selection))
-                .on_drop(cx.listener(move |ws, files: &DraggedFiles, window, cx| {
-                    let copy = window.modifiers().alt;
-                    ws.drop_files(files.paths.clone(), p2.clone(), copy, window, cx);
-                }))
-                .on_drop(cx.listener(
-                    move |ws, ext: &ExternalPaths, window, cx| {
-                        ws.start_transfer(
-                            haven_core::ops::OpKind::Copy,
-                            ext.paths().to_vec(),
-                            p3.clone(),
-                            window,
-                            cx,
-                        );
-                    },
-                ))
+                .map(|d| {
+                    file_drop_target(d, t.selection, cx, move |ws, dropped, window, cx| {
+                        ws.drop_files(dropped.paths, p2.clone(), dropped.copy, window, cx);
+                    })
+                })
             }
             None => row,
         }
@@ -265,6 +255,15 @@ impl Workspace {
                 .child(
                     div()
                         .id(SharedString::from(format!("unpin-{i}")))
+                        .size(px(20.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.control_hover))
+                        .tooltip(|_, cx| crate::ui::tooltip("Remove from Sidebar", cx))
                         .invisible()
                         .group_hover("pinrow", |s| s.visible())
                         .on_click(cx.listener(move |_, _, _, cx| {
@@ -319,39 +318,60 @@ impl Workspace {
             .map(|(i, v)| {
                 let active = active_dir.as_ref() == Some(&v.mount);
                 let mount = v.mount.clone();
-                let row = self.sidebar_row(
-                    SharedString::from(format!("sb-drive-{i}")),
-                    v.name.clone(),
-                    if v.ejectable { "usb" } else { "hard-drive" },
-                    active,
-                    Some(v.mount.clone()),
-                    cx,
-                );
-                row.when(v.ejectable, |d| {
+                let menu_mount = v.mount.clone();
+                let ejectable = v.ejectable;
+                let ejecting = self.ejecting.contains(&v.mount);
+                let row = self
+                    .sidebar_row(
+                        SharedString::from(format!("sb-drive-{i}")),
+                        v.name.clone(),
+                        if v.ejectable { "usb" } else { "hard-drive" },
+                        active,
+                        Some(v.mount.clone()),
+                        cx,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |ws, ev: &MouseDownEvent, _, cx| {
+                            let mut items = vec![overlays::MenuEntry::item(
+                                "Open in New Tab",
+                                "plus",
+                                NavigateTo(menu_mount.clone()),
+                                cx,
+                            )];
+                            if ejectable {
+                                items.push(overlays::MenuEntry::item(
+                                    "Eject",
+                                    "eject",
+                                    EjectVolume(menu_mount.clone()),
+                                    cx,
+                                ));
+                            }
+                            ws.open_menu_at(ev.position, items, cx);
+                        }),
+                    );
+                row.when(ejectable, |d| {
                     d.child(
                         div()
                             .id(SharedString::from(format!("eject-{i}")))
-                            .px(px(2.))
+                            .size(px(20.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.control_hover))
+                            .tooltip(|_, cx| crate::ui::tooltip("Eject", cx))
                             .on_click(cx.listener(move |ws, _, _, cx| {
                                 cx.stop_propagation();
-                                let m = mount.clone();
-                                let task = cx
-                                    .background_executor()
-                                    .spawn(async move { haven_core::volumes::eject(&m) });
-                                cx.spawn(async move |this, cx| {
-                                    let r = task.await;
-                                    let _ = this.update(cx, |ws, cx| {
-                                        match r {
-                                            Ok(()) => ws.show_toast("Ejected", false, cx),
-                                            Err(e) => ws.show_toast(e, true, cx),
-                                        }
-                                        crate::workspace::refresh_start_data(cx);
-                                    });
-                                })
-                                .detach();
-                                let _ = ws;
+                                ws.eject(mount.clone(), false, cx);
                             }))
-                            .child(icon("arrow-up").size(px(12.)).text_color(t.sidebar_label)),
+                            .child(
+                                icon(if ejecting { "loader-circle" } else { "eject" })
+                                    .size(px(13.))
+                                    .text_color(t.sidebar_icon),
+                            ),
                     )
                 })
                 .into_any_element()
@@ -376,13 +396,13 @@ impl Workspace {
                     .px(px(8.))
                     .flex()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(px(8.))
                     .rounded(px(6.))
                     .text_size(px(13.))
                     .text_color(t.text)
                     .cursor_pointer()
                     .when(active, |d| d.bg(t.active))
-                    .when(!active, |d| d.hover(|s| s.bg(t.hover)))
+                    .when(!active, |d| d.hover(|s| s.bg(t.sidebar_hover)))
                     .on_click(cx.listener(move |ws, _, window, cx| {
                         let tab = ws.active_tab().clone();
                         tab.update(cx, |t, cx| {
@@ -393,11 +413,12 @@ impl Workspace {
                     .child(
                         div()
                             .w(px(15.))
+                            .flex_none()
                             .flex()
                             .justify_center()
                             .child(tag_dot(color, px(9.))),
                     )
-                    .child(tag.name.clone())
+                    .child(div().flex_1().min_w_0().ellipsis().child(tag.name.clone()))
                     .into_any_element()
             })
             .collect();
@@ -406,19 +427,21 @@ impl Workspace {
         let pin_drop = div()
             .id("sb-pins-drop")
             .rounded(px(6.))
-            .drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(t.hover))
-            .on_drop(cx.listener(|_, files: &DraggedFiles, _, cx| {
-                let dirs: Vec<PathBuf> =
-                    files.paths.iter().filter(|p| p.is_dir()).cloned().collect();
-                Store::update(cx, |s| {
-                    for d in &dirs {
-                        if !s.sidebar_pins.contains(d) {
-                            s.sidebar_pins.push(d.clone());
+            .map(|d| {
+                // Folders dropped here (from Haven or Finder) get pinned.
+                file_drop_target(d, t.sidebar_hover, cx, |_, dropped, _, cx| {
+                    let dirs: Vec<PathBuf> =
+                        dropped.paths.into_iter().filter(|p| p.is_dir()).collect();
+                    Store::update(cx, |s| {
+                        for d in &dirs {
+                            if !s.sidebar_pins.contains(d) {
+                                s.sidebar_pins.push(d.clone());
+                            }
                         }
-                    }
-                });
-                cx.notify();
-            }))
+                    });
+                    cx.notify();
+                })
+            })
             .child(self.section("pinned", "Pinned", pins, cx));
 
         div()
@@ -486,13 +509,16 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap(px(7.))
-                    .rounded(px(7.))
+                    .rounded(px(6.))
                     .text_size(px(12.))
                     .cursor_pointer()
+                    // Every tab has the border (transparent when inactive) so
+                    // activating one doesn't shift its content by a pixel.
+                    .border_1()
+                    .border_color(gpui::transparent_black())
                     .when(active, |d| {
                         d.bg(t.elevated)
                             .text_color(t.text)
-                            .border_1()
                             .border_color(t.card_border)
                     })
                     .when(!active, |d| {
@@ -512,11 +538,9 @@ impl Workspace {
                         }),
                     )
                     .when_some(dest, |d, dest| {
-                        d.drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(t.selection))
-                            .on_drop(cx.listener(move |ws, files: &DraggedFiles, window, cx| {
-                                let copy = window.modifiers().alt;
-                                ws.drop_files(files.paths.clone(), dest.clone(), copy, window, cx);
-                            }))
+                        file_drop_target(d, t.selection, cx, move |ws, dropped, window, cx| {
+                            ws.drop_files(dropped.paths, dest.clone(), dropped.copy, window, cx);
+                        })
                     })
                     .child(icon(ic).size(px(13.)).text_color(if active {
                         t.accent_text
@@ -661,20 +685,23 @@ impl Workspace {
                                     let a = a.clone();
                                     move |ws, _, window, cx| ws.navigate_to(&a, window, cx)
                                 }))
-                                .drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(t.selection))
-                                .on_drop(cx.listener({
+                                .map(|d| {
                                     let a = a.clone();
-                                    move |ws, files: &DraggedFiles, window, cx| {
-                                        let copy = window.modifiers().alt;
-                                        ws.drop_files(
-                                            files.paths.clone(),
-                                            a.clone(),
-                                            copy,
-                                            window,
-                                            cx,
-                                        )
-                                    }
-                                }))
+                                    file_drop_target(
+                                        d,
+                                        t.selection,
+                                        cx,
+                                        move |ws, dropped, window, cx| {
+                                            ws.drop_files(
+                                                dropped.paths,
+                                                a.clone(),
+                                                dropped.copy,
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    )
+                                })
                                 .children(icon_el.map(|img| gpui::img(img).size(px(14.))))
                                 .child(label)
                                 .into_any_element(),
@@ -710,11 +737,11 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .rounded(px(5.))
-                        .text_size(px(12.5))
+                        .rounded(px(6.))
+                        .text_size(px(13.))
                         .text_color(t.text)
                         .when(selected, |d| d.bg(t.selection))
-                        .hover(|s| s.bg(t.hover))
+                        .when(!selected, |d| d.hover(|s| s.bg(t.hover)))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |ws, _: &MouseDownEvent, window, cx| {
@@ -755,7 +782,7 @@ impl Workspace {
                             div()
                                 .px(px(10.))
                                 .pt(px(4.))
-                                .text_size(px(10.5))
+                                .text_size(px(11.))
                                 .text_color(t.text_faint)
                                 .child("Tab completes · ↑↓ choose · ↩ go"),
                         ),
@@ -779,7 +806,7 @@ impl Workspace {
             .bg(t.field_bg)
             .border_1()
             .border_color(border)
-            .text_size(px(12.5))
+            .text_size(px(13.))
             .cursor_text()
             .on_mouse_down(
                 MouseButton::Left,
@@ -812,7 +839,7 @@ impl Workspace {
         let view = tab.view;
         let preview_on = Store::get(cx).preview_visible;
         let nav = |id: &'static str, ic: &'static str, enabled: bool, cx: &mut Context<Self>| {
-            icon_button(id, ic, cx).when(!enabled, |d| d.opacity(0.35))
+            crate::ui::icon_button_state(id, ic, enabled, false, cx)
         };
         let seg = |id: &'static str, ic: &'static str, mode: ViewMode, cx: &mut Context<Self>| {
             let on = view == mode && has_dir;
@@ -822,10 +849,10 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(5.))
+                .rounded(px(6.))
                 .cursor_pointer()
                 .when(on, |d| d.bg(t.active))
-                .hover(|s| s.bg(t.hover))
+                .when(!on, |d| d.hover(|s| s.bg(t.hover)))
                 .on_click(cx.listener(move |ws, _, _, cx| {
                     ws.active_tab()
                         .clone()
@@ -885,7 +912,7 @@ impl Workspace {
                     } else {
                         t.field_border
                     })
-                    .text_size(px(12.5))
+                    .text_size(px(13.))
                     .text_color(t.text)
                     .child(icon("search").size(px(13.)).text_color(t.text_faint))
                     .child(self.filter_field.clone())
@@ -918,8 +945,7 @@ impl Workspace {
                 }),
             ))
             .child(
-                icon_button("preview-toggle", "panel-right", cx)
-                    .when(preview_on, |d| d.bg(t.active))
+                crate::ui::icon_button_state("preview-toggle", "panel-right", true, preview_on, cx)
                     .on_click(cx.listener(|_, _, window, cx| {
                         window.dispatch_action(Box::new(TogglePreview), cx)
                     })),
@@ -1055,7 +1081,7 @@ impl Workspace {
                         d.child(
                             div()
                                 .ellipsis()
-                                .text_size(px(10.5))
+                                .text_size(px(11.))
                                 .text_color(t.text_faint)
                                 .child(current),
                         )
@@ -1149,17 +1175,12 @@ impl Render for Workspace {
                     s.show_hidden = !s.show_hidden;
                     s.show_hidden
                 });
+                // The Store observer (Workspace::new) reloads every tab.
                 ws.show_toast(if on { "Showing hidden files" } else { "Hiding hidden files" }, false, cx);
-                for tab in ws.tabs.clone() {
-                    tab.update(cx, |t, cx| {
-                        t.column_cache.clear();
-                        t.reload(cx)
-                    });
-                }
             }))
-            .on_action(cx.listener(|ws, _: &TogglePreview, _, cx| {
+            .on_action(cx.listener(|_, _: &TogglePreview, _, cx| {
+                // The Store observer (Workspace::new) refreshes the previews.
                 Store::update(cx, |s| s.preview_visible = !s.preview_visible);
-                ws.active_tab().clone().update(cx, |t, cx| t.invalidate_preview(cx));
                 cx.notify();
             }))
             .on_action(cx.listener(|ws, _: &GetInfo, _, cx| {
@@ -1244,8 +1265,32 @@ impl Render for Workspace {
                 window.focus(&ws.focus);
                 cx.notify();
             }))
-            .on_action(cx.listener(|ws, _: &RestoreFinder, _, cx| ws.set_default_viewer(false, cx)))
+            .on_action(cx.listener(|ws, _: &RestoreFinder, window, cx| {
+                // Confirm like "Make Default": it rewrites a system-wide setting
+                // (and drops any other file viewer the user had chosen).
+                ws.overlay = Some(Overlay::Confirm {
+                    title: "Use Finder as the default file viewer?".into(),
+                    body: "Clears NSFileViewer and gives folders back to Finder, replacing whichever file viewer is set now.".into(),
+                    confirm: "Use Finder".into(),
+                    action: Box::new(ConfirmDefaultViewer(false)),
+                });
+                window.focus(&ws.focus);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|ws, a: &EjectVolume, _, cx| ws.eject(a.0.clone(), false, cx)))
+            .on_action(cx.listener(|ws, a: &EjectVolumeConfirmed, _, cx| ws.eject(a.0.clone(), true, cx)))
+            .on_action(cx.listener(|ws, _: &EjectSelected, _, cx| ws.eject_current(cx)))
             .on_action(cx.listener(|ws, a: &ConfirmDefaultViewer, _, cx| ws.set_default_viewer(a.0, cx)))
+            .on_drag_move(cx.listener(|_, ev: &DragMoveEvent<DraggedFiles>, window, cx| {
+                // Leaving the window turns the drag into a native one, so
+                // files can be dropped on Finder, the Desktop or other apps.
+                if crate::native_drag::outside_window(ev.event.position, window.viewport_size()) {
+                    let files = ev.drag(cx).clone();
+                    if crate::native_drag::hand_off(&files, window, cx) {
+                        cx.stop_active_drag(window);
+                    }
+                }
+            }))
             .on_drag_move(cx.listener(|_, ev: &DragMoveEvent<SidebarSplitter>, _, cx| {
                 let w = f32::from(ev.event.position.x - ev.bounds.left()).clamp(160., 360.);
                 Store::update(cx, |s| s.sidebar_width = w);

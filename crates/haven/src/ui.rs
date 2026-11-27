@@ -19,8 +19,21 @@ pub fn icon_sized(name: &str, size: Pixels, color: Hsla) -> Svg {
 
 /// A square icon button with hover state.
 pub fn icon_button(id: impl Into<ElementId>, name: &str, cx: &App) -> gpui::Stateful<Div> {
+    icon_button_state(id, name, true, false, cx)
+}
+
+/// An icon button that may be disabled (faded, no hover) or "on" (keeps its
+/// active fill under the pointer). gpui allows one `hover` per element, so
+/// the state is decided here rather than layered on by callers.
+pub fn icon_button_state(
+    id: impl Into<ElementId>,
+    name: &str,
+    enabled: bool,
+    on: bool,
+    cx: &App,
+) -> gpui::Stateful<Div> {
     let t = theme(cx);
-    div()
+    let base = div()
         .id(id)
         .flex()
         .items_center()
@@ -28,10 +41,16 @@ pub fn icon_button(id: impl Into<ElementId>, name: &str, cx: &App) -> gpui::Stat
         .size(px(26.))
         .rounded(px(6.))
         .text_color(t.text_muted)
-        .hover(|s| s.bg(t.hover))
-        .active(|s| s.bg(t.active))
-        .cursor_pointer()
-        .child(icon(name).size(px(15.)).text_color(t.text_muted))
+        .child(icon(name).size(px(15.)).text_color(t.text_muted));
+    if !enabled {
+        base.opacity(0.35).cursor_default()
+    } else if on {
+        base.bg(t.active).cursor_pointer()
+    } else {
+        base.hover(|s| s.bg(t.hover))
+            .active(|s| s.bg(t.active))
+            .cursor_pointer()
+    }
 }
 
 pub fn text_button(
@@ -141,3 +160,29 @@ pub trait Ellipsis: gpui::Styled + Sized {
 }
 
 impl<T: gpui::Styled> Ellipsis for T {}
+
+/// A small hover tooltip (use with `.tooltip(|_, cx| tooltip("…", cx))`).
+pub struct Tooltip(SharedString);
+
+impl gpui::Render for Tooltip {
+    fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let t = theme(cx);
+        div()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(5.))
+            .bg(t.popover_bg)
+            .border_1()
+            .border_color(t.card_border)
+            .font_family(crate::theme::UI_FONT)
+            .text_size(px(12.))
+            .text_color(t.text)
+            .child(self.0.clone())
+    }
+}
+
+pub fn tooltip(text: impl Into<SharedString>, cx: &mut App) -> gpui::AnyView {
+    use gpui::AppContext as _;
+    let text = text.into();
+    cx.new(|_| Tooltip(text)).into()
+}

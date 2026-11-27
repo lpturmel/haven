@@ -1,17 +1,37 @@
 //! Icon grid with native icons and image thumbnails.
 
 use gpui::{
-    AnyElement, Context, ExternalPaths, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ObjectFit, ParentElement, StatefulInteractiveElement, Styled, StyledImage,
-    Window, canvas, div, img, prelude::FluentBuilder, px, uniform_list,
+    AnyElement, App, Context, InteractiveElement, IntoElement, LineFragment, MouseButton,
+    MouseDownEvent, ObjectFit, ParentElement, Pixels, SharedString, StatefulInteractiveElement,
+    Styled, StyledImage, Window, canvas, div, img, prelude::FluentBuilder, px, uniform_list,
 };
 use haven_core::kind::is_image_ext;
 
-use super::{drag_payload, drag_preview, entry_icon_el};
+use super::{drag_payload, drag_preview, entry_icon_el, file_drop_target};
 use crate::store::Store;
-use crate::tab::{DraggedFiles, Tab};
-use crate::theme::theme;
+use crate::tab::Tab;
+use crate::theme::{UI_FONT, theme};
 use crate::ui::{empty_state, tag_dot};
+
+const LABEL_SIZE: f32 = 12.;
+
+/// Splits a tile label into at most two lines that each fit `width`, the
+/// second ending in "…" when the name is longer. Done here rather than with
+/// `line_clamp(2)`: gpui truncates a clamped text as one line twice as wide,
+/// so when word wrapping leaves room on line 1, line 2 overflows the tile.
+fn label_lines(name: &str, width: Pixels, cx: &App) -> (SharedString, Option<SharedString>) {
+    let mut wrapper = cx
+        .text_system()
+        .line_wrapper(gpui::font(UI_FONT), px(LABEL_SIZE));
+    let fragments = [LineFragment::text(name)];
+    let Some(split) = wrapper.wrap_line(&fragments, width).next().map(|b| b.ix) else {
+        return (SharedString::from(name.to_string()), None);
+    };
+    let (first, rest) = name.split_at(split);
+    let mut runs = Vec::new();
+    let second = wrapper.truncate_line(rest.trim_start().to_string().into(), width, "…", &mut runs);
+    (first.trim_end().to_string().into(), Some(second))
+}
 
 pub fn tile_width(icon: f32) -> f32 {
     icon + 48.
@@ -74,13 +94,12 @@ pub fn render(tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> Any
             }),
         )
         .when_some(dest, |d, dest| {
-            let dest2 = dest.clone();
-            d.on_drop(cx.listener(move |tab, files: &DraggedFiles, window, cx| {
-                tab.drop_on(dest.clone(), files.paths.clone(), window, cx);
-            }))
-            .on_drop(cx.listener(move |tab, ext: &ExternalPaths, window, cx| {
-                tab.drop_on(dest2.clone(), ext.paths().to_vec(), window, cx);
-            }))
+            file_drop_target(
+                d,
+                gpui::transparent_black(),
+                cx,
+                move |tab, dropped, _, cx| tab.drop_on(dest.clone(), dropped, cx),
+            )
         })
         .child(
             // Measures the available width to compute the column count.
@@ -131,6 +150,7 @@ fn tile(
     let payload = drag_payload(tab, ix);
     let navigable = entry.is_navigable();
     let path = entry.path.clone();
+    let muted = if entry.hidden { 0.55 } else { 1.0 };
 
     div()
         .id(ix)
@@ -144,7 +164,6 @@ fn tile(
         .rounded(px(8.))
         .when(selected, |d| d.bg(t.selection))
         .when(!selected, |d| d.hover(|s| s.bg(t.hover)))
-        .opacity(if entry.hidden { 0.55 } else { 1.0 })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |tab, ev: &MouseDownEvent, window, cx| {
@@ -162,13 +181,11 @@ fn tile(
         .on_click(cx.listener(move |tab, _, _, cx| tab.click_item(ix, cx)))
         .on_drag(payload, |files, _, _, cx| drag_preview(files, cx))
         .when(navigable, |d| {
-            d.drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(t.selection))
-                .on_drop(cx.listener(move |tab, files: &DraggedFiles, window, cx| {
-                    cx.stop_propagation();
-                    if !files.paths.contains(&path) {
-                        tab.drop_on(path.clone(), files.paths.clone(), window, cx);
-                    }
-                }))
+            file_drop_target(d, t.selection, cx, move |tab, dropped, _, cx| {
+                if !dropped.paths.contains(&path) {
+                    tab.drop_on(path.clone(), dropped, cx);
+                }
+            })
         })
         .child(
             div()
@@ -176,11 +193,14 @@ fn tile(
                 .flex()
                 .items_center()
                 .justify_center()
+                // Hidden items fade their content, not the hover/selection fill.
+                .opacity(muted)
                 .child(visual),
         )
         .child(
             div()
                 .w_full()
+                .opacity(muted)
                 .flex()
                 .justify_center()
                 .items_center()
@@ -193,22 +213,51 @@ fn tile(
                         .unwrap_or(tag.color);
                     tag_dot(t.tag(color), px(7.))
                 }))
-                .child(
-                    // flex_1 gives the label a definite width so long names
-                    // wrap inside the cell (and ellipsize on line 2) instead
-                    // of overflowing it on both sides.
+                .child({
+                    let tags = entry.tags.len().min(3) as f32;
+                    // Tile padding (2 × 6) and the tag dots with their gaps.
+                    let width = tile_w - 12. - tags * 11.;
+                    let (first, second) = label_lines(&entry.name, px(width), cx);
                     div()
-                        .flex_1()
                         .min_w_0()
-                        .overflow_hidden()
-                        .text_size(px(12.))
-                        .text_color(t.text)
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .text_size(px(LABEL_SIZE))
                         .line_height(px(15.))
-                        .text_center()
-                        .line_clamp(2)
-                        .text_ellipsis()
-                        .child(entry.name.clone()),
-                ),
+                        .text_color(t.text)
+                        .child(div().whitespace_nowrap().child(first))
+                        .children(second.map(|l| div().whitespace_nowrap().child(l)))
+                }),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn long_labels_fit_two_lines(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let width = px(tile_width(72.) - 12.);
+            let name = "A folder with a really long name that should ellipsize nicely";
+            let (first, second) = label_lines(name, width, cx);
+            let second = second.expect("wraps to a second line");
+            assert!(second.ends_with('…'), "{second}");
+            assert!(name.starts_with(first.as_ref()));
+            let mut w = cx
+                .text_system()
+                .line_wrapper(gpui::font(UI_FONT), px(LABEL_SIZE));
+            for line in [first.as_ref(), second.as_ref()] {
+                // Each line fits on its own (no further wrap point).
+                let frags = [LineFragment::text(line)];
+                assert!(
+                    w.wrap_line(&frags, width).next().is_none(),
+                    "{line:?} overflows"
+                );
+            }
+            assert_eq!(label_lines("docs", width, cx), ("docs".into(), None));
+        });
+    }
 }

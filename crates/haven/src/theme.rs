@@ -11,6 +11,9 @@ pub struct Theme {
     pub sidebar_label: Hsla,
     /// Row icons on the frosted sidebar.
     pub sidebar_icon: Hsla,
+    /// Hovered sidebar rows: a touch stronger than `hover`, which is too
+    /// faint over the frosted material.
+    pub sidebar_hover: Hsla,
     pub card_bg: Hsla,
     pub card_border: Hsla,
     pub elevated: Hsla,
@@ -26,6 +29,9 @@ pub struct Theme {
     pub selection: Hsla,
     pub selection_inactive: Hsla,
     pub hover: Hsla,
+    /// Small inline buttons inside a hoverable row or card (eject, unpin):
+    /// stronger than the row's own hover so the button stands out.
+    pub control_hover: Hsla,
     pub active: Hsla,
     pub danger: Hsla,
     pub success: Hsla,
@@ -47,6 +53,7 @@ impl Theme {
             sidebar_bg: hsla(240. / 360., 0.06, 0.08, 0.35),
             sidebar_label: hsla(0., 0., 1., 0.62),
             sidebar_icon: hsla(0., 0., 1., 0.72),
+            sidebar_hover: hsla(0., 0., 1., 0.07),
             card_bg: rgb(0x1c1c1f).into(),
             card_border: hsla(0., 0., 1., 0.08),
             elevated: rgb(0x26262b).into(),
@@ -62,6 +69,7 @@ impl Theme {
             selection: rgba(0x0a84ff40).into(),
             selection_inactive: hsla(0., 0., 1., 0.09),
             hover: hsla(0., 0., 1., 0.05),
+            control_hover: hsla(0., 0., 1., 0.14),
             active: hsla(0., 0., 1., 0.09),
             danger: rgb(0xff453a).into(),
             success: rgb(0x32d74b).into(),

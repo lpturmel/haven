@@ -65,6 +65,8 @@ actions!(
         RestoreFinder,
         Dismiss,
         ConfirmModal,
+        OpenSettings,
+        EjectSelected,
     ]
 );
 
@@ -103,6 +105,16 @@ pub struct ThenSortBy(pub haven_core::SortKey);
 #[action(namespace = haven, no_json)]
 pub struct UnpinSidebar(pub PathBuf);
 
+/// Eject (or unmount) the volume mounted at this path.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = haven, no_json)]
+pub struct EjectVolume(pub PathBuf);
+
+/// Eject confirmed although other volumes on the same disk go too.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = haven, no_json)]
+pub struct EjectVolumeConfirmed(pub PathBuf);
+
 /// Confirmed default-viewer change.
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = haven, no_json)]
@@ -121,6 +133,8 @@ pub fn bind_keys(cx: &mut App) {
     let ws = Some(WORKSPACE);
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("cmd-e", EjectSelected, ws),
         KeyBinding::new("escape", Dismiss, ws),
         // Enter takes the primary button of the conflict / confirm dialogs
         // (they hold focus on the workspace, so the file view's Enter is out).
@@ -244,6 +258,8 @@ pub fn shortcut_label(action: &dyn Action, cx: &App) -> Option<String> {
         "haven::OpenSelected" => "↩",
         "haven::OpenInNewTab" => "⌘↩",
         "haven::SelectAllItems" => "⌘A",
+        "haven::OpenSettings" => "⌘,",
+        "haven::EjectSelected" => "⌘E",
         _ => return None,
     };
     Some(label.to_string())
