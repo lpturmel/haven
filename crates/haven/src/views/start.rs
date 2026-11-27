@@ -19,7 +19,7 @@ use crate::store::Store;
 use crate::tab::{Location, Tab};
 use crate::theme::theme;
 use crate::ui::Ellipsis as _;
-use crate::ui::{icon, icon_button, tag_dot};
+use crate::ui::{icon, inline_button, tag_dot};
 
 /// Drives and recents, refreshed by the workspace.
 #[derive(Default)]
@@ -122,15 +122,18 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                         .right(px(2.))
                         .invisible()
                         .group_hover("pin", |s| s.visible())
-                        .child(icon_button(("unpin", i), "x", cx).size(px(20.)).on_click(
-                            cx.listener(move |_, _, _, cx| {
-                                cx.stop_propagation();
-                                Store::update(cx, |s| s.toggle_start_pin(&unpin));
-                                // The tiles come from StartData, not the store.
-                                crate::workspace::refresh_pins(cx);
-                                cx.notify();
-                            }),
-                        )),
+                        .child(
+                            inline_button(("unpin", i), cx)
+                                .tooltip(|_, cx| crate::ui::tooltip("Remove from Start", cx))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    Store::update(cx, |s| s.toggle_start_pin(&unpin));
+                                    // The tiles come from StartData, not the store.
+                                    crate::workspace::refresh_pins(cx);
+                                    cx.notify();
+                                }))
+                                .child(icon("x").size(px(12.)).text_color(t.text_muted)),
+                        ),
                 )
                 .into_any_element()
         })
@@ -201,16 +204,7 @@ pub fn render(_tab: &mut Tab, _window: &mut Window, cx: &mut Context<Tab>) -> An
                     .when(v.ejectable, |d| {
                         let m = v.mount.clone();
                         d.child(
-                            div()
-                                .id(("eject-drive", i))
-                                .size(px(20.))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(4.))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(t.control_hover))
+                            inline_button(("eject-drive", i), cx)
                                 .tooltip(|_, cx| crate::ui::tooltip("Eject", cx))
                                 .on_click(move |_, window, cx| {
                                     cx.stop_propagation();

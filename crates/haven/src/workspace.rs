@@ -2226,4 +2226,48 @@ mod tests {
             _ => panic!("expected the folder preview"),
         });
     }
+
+    #[gpui::test]
+    async fn inline_buttons_and_tag_rings_render(cx: &mut TestAppContext) {
+        // Draws the elements built on `ui::inline_button` (Start and sidebar
+        // unpin ✕, tab ✕) and a context menu with a tag that's on, so a
+        // second `.hover()` on any of them (a gpui panic) fails here.
+        init(cx);
+        let root = fixture();
+        let projects = root.join("projects");
+        cx.update(|cx| {
+            let pin = haven_core::Entry::from_path(&projects).unwrap();
+            cx.global_mut::<StartData>().pinned.push(pin);
+            Store::update(cx, |s| s.toggle_sidebar_pin(&projects));
+        });
+        let locs = vec![Location::Start, Location::Dir(projects.clone())];
+        let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(locs, 1, window, cx));
+        cx.run_until_parked();
+        let tab = ws.read_with(cx, |ws, _| ws.active_tab().clone());
+        let ix = tab.update(cx, |t, cx| {
+            let ix = t
+                .entries
+                .iter()
+                .position(|e| e.name == "readme.md")
+                .unwrap();
+            t.select_only(ix, cx);
+            ix
+        });
+        ws.update(cx, |ws, cx| {
+            ws.apply_tag(Tag::new("Red", haven_core::TagColor::Red), true, cx)
+        });
+        cx.run_until_parked();
+        tab.update_in(cx, |t, window, cx| {
+            t.context_item(ix, gpui::point(gpui::px(80.), gpui::px(120.)), window, cx)
+        });
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| assert!(ws.context_menu.is_some()));
+        draw(cx);
+        ws.update_in(cx, |ws, window, cx| ws.activate(0, window, cx));
+        draw(cx);
+        assert_eq!(
+            ws.read_with(cx, |ws, cx| ws.active_tab().read(cx).location.clone()),
+            Location::Start
+        );
+    }
 }

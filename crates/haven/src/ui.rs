@@ -22,6 +22,24 @@ pub fn icon_button(id: impl Into<ElementId>, name: &str, cx: &App) -> gpui::Stat
     icon_button_state(id, name, true, false, cx)
 }
 
+/// A small button inside a hoverable row, tile or tab (eject, unpin, close
+/// tab): 20×20, radius 4, and a `control_hover` fill strong enough to stand
+/// out over the row's own hover. Callers add the icon. gpui panics on a
+/// second `.hover()`, so callers must not add their own.
+pub fn inline_button(id: impl Into<ElementId>, cx: &App) -> gpui::Stateful<Div> {
+    let t = theme(cx);
+    div()
+        .id(id)
+        .size(px(20.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .cursor_pointer()
+        .hover(|s| s.bg(t.control_hover))
+}
+
 /// An icon button that may be disabled (faded, no hover) or "on" (keeps its
 /// active fill under the pointer). gpui allows one `hover` per element, so
 /// the state is decided here rather than layered on by callers.
