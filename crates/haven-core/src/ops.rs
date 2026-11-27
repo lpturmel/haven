@@ -385,14 +385,24 @@ fn resolved(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Like `resolved`, but a symlink stays itself: only its parent folder is
+/// resolved. Moving or copying a link moves the link, not what it points to.
+fn resolved_item(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => resolved(parent).join(name),
+        _ => resolved(path),
+    }
+}
+
 /// The first of `sources` that `dest` is, or lies inside, once symlinks are
 /// resolved. Moving or copying it into `dest` would put a folder inside
-/// itself. Touches the filesystem: call it off the UI thread.
+/// itself. A dragged symlink counts as the link, not its target. Touches the
+/// filesystem: call it off the UI thread.
 pub fn source_containing(sources: &[PathBuf], dest: &Path) -> Option<PathBuf> {
     let dest = resolved(dest);
     sources
         .iter()
-        .find(|s| dest.starts_with(resolved(s)))
+        .find(|s| dest.starts_with(resolved_item(s)))
         .cloned()
 }
 
@@ -878,6 +888,41 @@ mod tests {
         assert_eq!(
             source_containing(&[root.join("a")], &root.join("a/new")),
             Some(root.join("a"))
+        );
+    }
+
+    #[test]
+    fn a_symlink_moves_into_the_folder_it_points_to() {
+        let (_d, root) = setup();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir(root.join("links")).unwrap();
+        std::os::unix::fs::symlink(root.join("a"), root.join("links/to_a")).unwrap();
+        let link = root.join("links/to_a");
+        for dest in [root.join("a"), root.join("a/b")] {
+            assert_eq!(source_containing(std::slice::from_ref(&link), &dest), None);
+        }
+        transfer(
+            OpKind::Move,
+            std::slice::from_ref(&link),
+            &root.join("a/b"),
+            Conflict::KeepBoth,
+            &Progress::default(),
+        )
+        .unwrap();
+        let moved = root.join("a/b/to_a");
+        assert!(
+            fs::symlink_metadata(&moved)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(fs::symlink_metadata(&link).is_err());
+        // Parents still resolve: a real folder dragged by an aliased path is
+        // still caught.
+        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+        assert_eq!(
+            source_containing(&[root.join("alias/a")], &root.join("a/b")),
+            Some(root.join("alias/a"))
         );
     }
 
