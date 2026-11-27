@@ -715,6 +715,14 @@ impl Workspace {
     /// waits behind any dialog opened meanwhile (see `show_queued_overlay`,
     /// which `render` calls) instead of replacing it.
     fn ask_eject_all(&mut self, mount: &Path, siblings: &[PathBuf], cx: &mut Context<Self>) {
+        // ⌘E again while the question is up (or waiting) asks nothing new.
+        let answer = crate::actions::EjectVolumeConfirmed(mount.to_path_buf());
+        let asks_already = |o: &Overlay| matches!(o, Overlay::Confirm { action, .. } if action.partial_eq(&answer));
+        if self.overlay.as_ref().is_some_and(asks_already)
+            || self.queued_overlays.iter().any(asks_already)
+        {
+            return;
+        }
         let others: Vec<String> = siblings.iter().map(|p| volume_name(p)).collect();
         self.queued_overlays.push_back(Overlay::Confirm {
             title: format!(
@@ -2489,6 +2497,15 @@ mod tests {
         cx.run_until_parked();
         ws.read_with(cx, |ws, _| {
             assert!(is_eject_all(&ws.overlay));
+            assert!(!ws.has_queued_overlay());
+        });
+        // Asking again while it's up (⌘E twice) doesn't queue a duplicate.
+        ws.update_in(cx, |ws, _, cx| {
+            ws.ask_eject_all(
+                Path::new("/Volumes/Disk A"),
+                &[PathBuf::from("/Volumes/Disk B")],
+                cx,
+            );
             assert!(!ws.has_queued_overlay());
         });
         // With nothing open, it shows straight away.
