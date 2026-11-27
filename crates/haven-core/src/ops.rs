@@ -447,7 +447,9 @@ pub fn transfer(
                 continue;
             };
             let mut target = dest.join(name);
-            let same = target == *src;
+            // Compared resolved: `/tmp/x/a` moved into `/private/tmp/x` is
+            // already where it belongs (not a conflict with itself).
+            let same = resolved_item(&target) == resolved_item(src);
             if same && kind == OpKind::Move {
                 continue;
             }
@@ -456,8 +458,10 @@ pub fn transfer(
                     Conflict::Skip if !same => continue,
                     Conflict::Replace if !same => {
                         // Never trash the source itself or a folder holding it
-                        // (moving `/x/a/a` into `/x` would trash `/x/a`).
-                        if dest.starts_with(src) || src.starts_with(&target) {
+                        // (moving `/x/a/a` into `/x` would trash `/x/a`),
+                        // however either path is spelled. (`dest` inside
+                        // `src` was refused up front.)
+                        if resolved_item(src).starts_with(resolved_item(&target)) {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
                                 "cannot replace a folder with itself",
@@ -1216,6 +1220,64 @@ mod tests {
         );
         assert!(out.is_err());
         assert_eq!(fs::read(root.join("a/a/keep.txt")).unwrap(), b"k");
+    }
+
+    /// The same guard with the source spelled through another path to the
+    /// same folder (`/tmp/…` against `/private/tmp/…`).
+    #[test]
+    fn replace_never_trashes_a_folder_holding_the_source_spelled_differently() {
+        let (_d, root) = setup();
+        fs::create_dir_all(root.join("x/a/a")).unwrap();
+        fs::write(root.join("x/a/a/keep.txt"), b"k").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+        let out = transfer(
+            OpKind::Move,
+            &[root.join("alias/x/a/a")],
+            &root.join("x"),
+            Conflict::Replace,
+            &Progress::default(),
+        );
+        assert!(out.is_err());
+        assert_eq!(fs::read(root.join("x/a/a/keep.txt")).unwrap(), b"k");
+    }
+
+    /// Moving an item into the folder it is already in is a no-op, however
+    /// either path is spelled: no "a copy.txt" rename.
+    #[test]
+    fn move_into_own_folder_spelled_differently_is_a_no_op() {
+        let (_d, root) = setup();
+        fs::create_dir(root.join("x")).unwrap();
+        fs::write(root.join("x/a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+        transfer(
+            OpKind::Move,
+            &[root.join("alias/x/a.txt")],
+            &root.join("x"),
+            Conflict::KeepBoth,
+            &Progress::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join("x/a.txt")).unwrap(), b"a");
+        assert!(!root.join("x/a copy.txt").exists());
+    }
+
+    /// With Replace, the "existing item" is the source itself: it must never
+    /// be trashed.
+    #[test]
+    fn replace_into_own_folder_spelled_differently_keeps_the_source() {
+        let (_d, root) = setup();
+        fs::create_dir(root.join("x")).unwrap();
+        fs::write(root.join("x/a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+        transfer(
+            OpKind::Move,
+            &[root.join("alias/x/a.txt")],
+            &root.join("x"),
+            Conflict::Replace,
+            &Progress::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join("x/a.txt")).unwrap(), b"a");
     }
 
     #[test]
