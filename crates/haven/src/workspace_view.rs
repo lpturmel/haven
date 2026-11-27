@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use gpui::{
     AnyElement, AppContext, Context, DragMoveEvent, Empty, FontWeight, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, deferred, div, prelude::FluentBuilder, px,
-    relative,
+    StatefulInteractiveElement, Styled, TextRun, Window, canvas, deferred, div,
+    prelude::FluentBuilder, px, relative,
 };
 use haven_core::state::ViewMode;
 use haven_core::{TagColor, fmt, home_dir};
@@ -22,6 +22,19 @@ use crate::ui::{icon, icon_button, inline_button, section_label, tag_dot};
 use crate::views::file_drop_target;
 use crate::views::start::start_data;
 use crate::workspace::Workspace;
+
+/// Path-bar crumb metrics, shared by the layout and the fit measurement.
+const CRUMB_TEXT: f32 = 13.;
+const CRUMB_PAD: f32 = 5.;
+const CRUMB_ICON: f32 = 14.;
+const CRUMB_ICON_GAP: f32 = 5.;
+const CRUMB_GAP: f32 = 1.;
+const CHEVRON_W: f32 = 11.;
+/// The filter field's width, and the narrower one it takes when the content
+/// area (window minus sidebar) is under `NARROW_CONTENT_W`.
+const FILTER_W: f32 = 190.;
+const FILTER_W_NARROW: f32 = 130.;
+const NARROW_CONTENT_W: f32 = 760.;
 
 #[derive(Clone)]
 pub struct SidebarSplitter;
@@ -570,7 +583,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_path_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_path_bar(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = theme(cx).clone();
         let tab = self.active_tab().read(cx);
         let location = tab.location.clone();
@@ -596,106 +609,36 @@ impl Workspace {
                 .child(self.path_field.clone())
                 .into_any_element()
         } else {
-            let crumbs: Vec<AnyElement> = match &location {
-                Location::Start => vec![div().text_color(t.text).child("Home").into_any_element()],
-                Location::Tag(name) => vec![
-                    div()
-                        .text_color(t.text_muted)
-                        .child("Tags")
-                        .into_any_element(),
-                    icon("chevron-right")
-                        .size(px(12.))
-                        .text_color(t.text_faint)
-                        .into_any_element(),
-                    div()
-                        .text_color(t.text)
-                        .child(name.clone())
-                        .into_any_element(),
-                ],
-                Location::Dir(dir) => {
-                    let ancestors: Vec<PathBuf> = {
-                        let mut v: Vec<PathBuf> = dir.ancestors().map(Path::to_path_buf).collect();
-                        v.reverse();
-                        v
-                    };
-                    let n = ancestors.len();
-                    let mut out = Vec::new();
-                    for (i, a) in ancestors.into_iter().enumerate() {
-                        let last = i + 1 == n;
-                        let label = if a == Path::new("/") {
-                            start_data(cx)
-                                .volumes
-                                .first()
-                                .map(|v| v.name.clone())
-                                .unwrap_or_else(|| "/".into())
-                        } else {
-                            a.file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default()
-                        };
-                        if i > 0 {
-                            out.push(
-                                icon("chevron-right")
-                                    .size(px(11.))
-                                    .text_color(t.text_faint)
-                                    .into_any_element(),
-                            );
-                        }
-                        let icon_el = (i == 0)
-                            .then(|| path_icon(&a, true, false, "", IconSize::Small, cx))
-                            .flatten();
-                        out.push(
-                            div()
-                                .id(("crumb", i))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(5.))
-                                .px(px(5.))
-                                .py(px(2.))
-                                .rounded(px(4.))
-                                .text_color(if last { t.text } else { t.text_muted })
-                                .when(last, |d| d.font_weight(FontWeight::MEDIUM))
-                                .hover(|s| s.bg(t.hover).text_color(t.text))
-                                .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener({
-                                    let a = a.clone();
-                                    move |ws, _, window, cx| ws.navigate_to(&a, window, cx)
-                                }))
-                                .map(|d| {
-                                    let a = a.clone();
-                                    file_drop_target(
-                                        d,
-                                        t.selection,
-                                        cx,
-                                        move |ws, dropped, window, cx| {
-                                            ws.drop_files(
-                                                dropped.paths,
-                                                a.clone(),
-                                                dropped.copy,
-                                                window,
-                                                cx,
-                                            )
-                                        },
-                                    )
-                                })
-                                .children(icon_el.map(|img| gpui::img(img).size(px(14.))))
-                                .child(label)
-                                .into_any_element(),
-                        );
-                    }
-                    out
-                }
-            };
+            let crumbs = self.render_crumbs(&location, window, cx);
+            let entity = cx.entity();
             div()
                 .id("crumbs")
+                .debug_selector(|| "crumbs".into())
+                .relative()
                 .flex_1()
                 .min_w_0()
                 .flex()
                 .items_center()
-                .gap(px(1.))
-                .overflow_x_scroll()
+                .gap(px(CRUMB_GAP))
+                .overflow_hidden()
+                .child(
+                    // Measures the room the crumbs get, to collapse the
+                    // leading ones into "…" when the path doesn't fit.
+                    canvas(
+                        move |bounds, _, cx| {
+                            let w = f32::from(bounds.size.width);
+                            entity.update(cx, |ws, cx| {
+                                if (ws.crumbs_width - w).abs() > 0.5 {
+                                    ws.crumbs_width = w;
+                                    cx.notify();
+                                }
+                            });
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
                 .children(crumbs)
                 .into_any_element()
         };
@@ -809,6 +752,189 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The path bar's crumbs: the current folder always shows (ellipsized as
+    /// a last resort); leading crumbs that don't fit collapse into "…".
+    fn render_crumbs(
+        &mut self,
+        location: &Location,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let t = theme(cx).clone();
+        let sep = || {
+            icon("chevron-right")
+                .size(px(CHEVRON_W))
+                .flex_none()
+                .text_color(t.text_faint)
+                .into_any_element()
+        };
+        let ancestors: Vec<PathBuf> = match location {
+            Location::Start => {
+                self.crumbs_hidden = 0..0;
+                return vec![
+                    div()
+                        .min_w_0()
+                        .ellipsis()
+                        .text_color(t.text)
+                        .child("Home")
+                        .into_any_element(),
+                ];
+            }
+            Location::Tag(name) => {
+                self.crumbs_hidden = 0..0;
+                return vec![
+                    div()
+                        .flex_none()
+                        .text_color(t.text_muted)
+                        .child("Tags")
+                        .into_any_element(),
+                    sep(),
+                    div()
+                        .min_w_0()
+                        .ellipsis()
+                        .text_color(t.text)
+                        .child(name.clone())
+                        .into_any_element(),
+                ];
+            }
+            Location::Dir(dir) => {
+                let mut v: Vec<PathBuf> = dir.ancestors().map(Path::to_path_buf).collect();
+                v.reverse();
+                v
+            }
+        };
+        let n = ancestors.len();
+        let labels: Vec<String> = ancestors
+            .iter()
+            .map(|a| {
+                if a == Path::new("/") {
+                    start_data(cx)
+                        .volumes
+                        .first()
+                        .map(|v| v.name.clone())
+                        .unwrap_or_else(|| "/".into())
+                } else {
+                    a.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                }
+            })
+            .collect();
+
+        // Measure each crumb as it will be drawn, to decide what fits.
+        let text_w = |s: &str, weight: FontWeight| -> f32 {
+            let mut font = gpui::font(UI_FONT);
+            font.weight = weight;
+            let run = TextRun {
+                len: s.len(),
+                font,
+                color: t.text,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let line = window.text_system().shape_line(
+                SharedString::from(s.to_string()),
+                px(CRUMB_TEXT),
+                &[run],
+                None,
+            );
+            f32::from(line.width)
+        };
+        let widths: Vec<f32> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let weight = if i + 1 == n {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                };
+                let icon = if i == 0 {
+                    CRUMB_ICON + CRUMB_ICON_GAP
+                } else {
+                    0.
+                };
+                text_w(label, weight) + icon + 2. * CRUMB_PAD
+            })
+            .collect();
+        let more_w = text_w("…", FontWeight::NORMAL) + 2. * CRUMB_PAD;
+        // A separator adds the chevron plus the row gap on each side; one
+        // more point absorbs rounding so the last crumb isn't clipped.
+        let sep_w = CHEVRON_W + 2. * CRUMB_GAP + 1.;
+        let hidden = haven_core::crumbs::fit(&widths, sep_w, more_w, self.crumbs_width);
+        self.crumbs_hidden = hidden.clone();
+
+        let mut out = Vec::new();
+        if !hidden.is_empty() {
+            // "…" opens the deepest hidden folder; its tooltip names it.
+            let target = ancestors[hidden.end - 1].clone();
+            let tip = haven_core::tildify(&target);
+            out.push(
+                div()
+                    .id("crumb-more")
+                    .debug_selector(|| "crumb-more".into())
+                    .flex_none()
+                    .px(px(CRUMB_PAD))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .text_color(t.text_muted)
+                    .hover(|s| s.bg(t.hover).text_color(t.text))
+                    .cursor_pointer()
+                    .tooltip(move |_, cx| crate::ui::tooltip(tip.clone(), cx))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener({
+                        let target = target.clone();
+                        move |ws, _, window, cx| ws.navigate_to(&target, window, cx)
+                    }))
+                    // Drops land in the folder "…" opens, like any crumb.
+                    .map(|d| crumb_drop_target(d, target, t.selection, cx))
+                    .child("…")
+                    .into_any_element(),
+            );
+        }
+        for (i, (a, label)) in ancestors.into_iter().zip(labels).enumerate() {
+            if i < hidden.end {
+                continue;
+            }
+            let last = i + 1 == n;
+            if !out.is_empty() {
+                out.push(sep());
+            }
+            let icon_el = (i == 0)
+                .then(|| path_icon(&a, true, false, "", IconSize::Small, cx))
+                .flatten();
+            out.push(
+                div()
+                    .id(("crumb", i))
+                    .when(last, |d| d.debug_selector(|| "crumb-last".into()))
+                    // Only the current folder may shrink (and ellipsize).
+                    .when(last, |d| d.flex_shrink().min_w_0())
+                    .when(!last, |d| d.flex_none())
+                    .flex()
+                    .items_center()
+                    .gap(px(CRUMB_ICON_GAP))
+                    .px(px(CRUMB_PAD))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .text_color(if last { t.text } else { t.text_muted })
+                    .when(last, |d| d.font_weight(FontWeight::MEDIUM))
+                    .hover(|s| s.bg(t.hover).text_color(t.text))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener({
+                        let a = a.clone();
+                        move |ws, _, window, cx| ws.navigate_to(&a, window, cx)
+                    }))
+                    .map(|d| crumb_drop_target(d, a.clone(), t.selection, cx))
+                    .children(icon_el.map(|img| gpui::img(img).flex_none().size(px(CRUMB_ICON))))
+                    .child(div().min_w_0().ellipsis().child(label))
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
     fn render_toolbar(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = theme(cx).clone();
         let tab = self.active_tab().read(cx);
@@ -842,6 +968,19 @@ impl Workspace {
                         .text_color(if on { t.text } else { t.text_muted }),
                 )
         };
+        // In a narrow window the filter field gives the path bar some room,
+        // so the current folder's name still fits.
+        let content_w = f32::from(window.viewport_size().width)
+            - if self.sidebar_visible {
+                Store::get(cx).sidebar_width
+            } else {
+                0.
+            };
+        let filter_w = if content_w < NARROW_CONTENT_W {
+            FILTER_W_NARROW
+        } else {
+            FILTER_W
+        };
         let filter_focused = self
             .filter_field
             .read(cx)
@@ -871,11 +1010,11 @@ impl Workspace {
                     ws.active_tab().clone().update(cx, |t, cx| t.go_parent(cx))
                 })),
             )
-            .child(self.render_path_bar(cx))
+            .child(self.render_path_bar(window, cx))
             .child(
                 div()
                     .id("filter")
-                    .w(px(190.))
+                    .w(px(filter_w))
                     .flex_none()
                     .h(px(30.))
                     .px(px(8.))
@@ -1320,4 +1459,17 @@ impl Render for Workspace {
             .children(overlay)
             .children(menu)
     }
+}
+
+/// Makes a path-bar crumb accept files dragged onto it (from Haven or other
+/// apps), dropping them into `dest`. Shared by every crumb, "…" included.
+fn crumb_drop_target<E: InteractiveElement>(
+    el: E,
+    dest: PathBuf,
+    highlight: gpui::Hsla,
+    cx: &Context<Workspace>,
+) -> E {
+    file_drop_target(el, highlight, cx, move |ws, dropped, window, cx| {
+        ws.drop_files(dropped.paths, dest.clone(), dropped.copy, window, cx)
+    })
 }

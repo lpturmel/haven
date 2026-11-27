@@ -2,6 +2,7 @@
 //! so it can be unit tested and benchmarked in isolation.
 
 pub mod complete;
+pub mod crumbs;
 pub mod dirsize;
 pub mod fmt;
 pub mod fuzzy;
