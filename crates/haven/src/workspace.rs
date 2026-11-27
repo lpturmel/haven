@@ -703,25 +703,32 @@ impl Workspace {
                     ws.run_eject(plan, cx);
                 } else {
                     ws.ejecting.remove(&mount);
-                    let others: Vec<String> =
-                        plan.siblings.iter().map(|p| volume_name(p)).collect();
-                    ws.overlay = Some(Overlay::Confirm {
-                        title: format!(
-                            "Eject “{}” and the other volumes on its disk?",
-                            volume_name(&mount)
-                        ),
-                        body: format!(
-                            "“{}” is on the same disk, so it will be ejected too.",
-                            others.join("”, “")
-                        ),
-                        confirm: "Eject All".into(),
-                        action: Box::new(crate::actions::EjectVolumeConfirmed(mount.clone())),
-                    });
-                    cx.notify();
+                    ws.ask_eject_all(&mount, &plan.siblings, cx);
                 }
             });
         })
         .detach();
+    }
+
+    /// Asks before ejecting `mount` together with the other volumes on its
+    /// disk. The answer arrives after a background plan, so the question
+    /// waits behind any dialog opened meanwhile (see `show_queued_overlay`,
+    /// which `render` calls) instead of replacing it.
+    fn ask_eject_all(&mut self, mount: &Path, siblings: &[PathBuf], cx: &mut Context<Self>) {
+        let others: Vec<String> = siblings.iter().map(|p| volume_name(p)).collect();
+        self.queued_overlays.push_back(Overlay::Confirm {
+            title: format!(
+                "Eject “{}” and the other volumes on its disk?",
+                volume_name(mount)
+            ),
+            body: format!(
+                "“{}” is on the same disk, so it will be ejected too.",
+                others.join("”, “")
+            ),
+            confirm: "Eject All".into(),
+            action: Box::new(crate::actions::EjectVolumeConfirmed(mount.to_path_buf())),
+        });
+        cx.notify();
     }
 
     /// Carries out a planned eject. Tabs showing any affected volume go to
@@ -2455,6 +2462,46 @@ mod tests {
                 toast.message
             );
         });
+    }
+
+    /// The "Eject All?" question comes back from a background plan: it waits
+    /// behind a dialog opened meanwhile, then shows.
+    #[gpui::test]
+    async fn eject_all_question_waits_for_an_open_dialog(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open(cx, Location::Dir(root.clone()));
+        let is_eject_all = |o: &Option<Overlay>| matches!(o, Some(Overlay::Confirm { confirm, .. }) if confirm == "Eject All");
+        ws.update_in(cx, |ws, _, cx| {
+            ws.overlay = Some(confirm_overlay());
+            ws.ask_eject_all(
+                Path::new("/Volumes/Disk A"),
+                &[PathBuf::from("/Volumes/Disk B")],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| {
+            assert!(matches!(ws.overlay, Some(Overlay::Confirm { .. })));
+            assert!(!is_eject_all(&ws.overlay), "replaced the open dialog");
+        });
+        ws.update_in(cx, |ws, window, cx| ws.close_overlay(window, cx));
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| {
+            assert!(is_eject_all(&ws.overlay));
+            assert!(!ws.has_queued_overlay());
+        });
+        // With nothing open, it shows straight away.
+        ws.update_in(cx, |ws, window, cx| {
+            ws.close_overlay(window, cx);
+            ws.ask_eject_all(
+                Path::new("/Volumes/Disk A"),
+                &[PathBuf::from("/Volumes/Disk B")],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| assert!(is_eject_all(&ws.overlay)));
     }
 
     #[gpui::test]
