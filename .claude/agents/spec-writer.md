@@ -44,6 +44,14 @@ Write exactly one file, `<folder>/spec.md`:
 
 - <tests to add or update; never weaken an existing one>
 
+## Visual scenarios
+
+- <ui jobs only: one line per `scripts/visual-scenarios/<name>.json` the
+  builder adds, with its window size, state (tabs, view, folder) and what the
+  capture must show. The gate screenshots each one and the ui-reviewer judges
+  them; that is the job's only visual validation. Omit this section for jobs
+  without the `ui` surface.>
+
 ## Assumptions
 
 - <choices you made where the request was open>

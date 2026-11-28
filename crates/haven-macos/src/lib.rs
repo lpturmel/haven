@@ -67,6 +67,27 @@ pub unsafe fn install_sidebar_material(ns_view: *mut std::ffi::c_void) -> bool {
 }
 
 /// Moves `path` to the Trash and returns where it ended up (so it can be undone).
+/// Unattended screenshots (`HAVEN_CAPTURE=1`): float the window above every
+/// other app's windows, on every Space, and let clicks pass through, without
+/// activating the app. It stays visible, so gpui keeps drawing it (it stops
+/// for occluded windows), and the owner's focus never moves.
+///
+/// # Safety
+/// `ns_view` must be a live `NSView` (the window's content view), and this
+/// must run on the main thread.
+pub unsafe fn float_for_capture(ns_view: *mut std::ffi::c_void) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: forwarded caller contract.
+        unsafe { imp::float_for_capture(ns_view) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ns_view;
+        false
+    }
+}
+
 pub fn trash(path: &Path) -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
@@ -255,6 +276,28 @@ mod imp {
             NSWindowOrderingMode::Below,
             Some(content),
         );
+        true
+    }
+
+    pub unsafe fn float_for_capture(ns_view: *mut std::ffi::c_void) -> bool {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSView, NSWindowCollectionBehavior};
+        if MainThreadMarker::new().is_none() || ns_view.is_null() {
+            return false;
+        }
+        // SAFETY: the caller guarantees a live NSView.
+        let content: &NSView = unsafe { &*(ns_view as *const NSView) };
+        let Some(window) = content.window() else {
+            return false;
+        };
+        // kCGFloatingWindowLevel: above normal windows of every app.
+        window.setLevel(3);
+        window.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+        window.setIgnoresMouseEvents(true);
+        window.orderFrontRegardless();
         true
     }
 

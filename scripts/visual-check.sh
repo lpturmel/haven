@@ -13,6 +13,22 @@
 #   grid.png     grid view (includes a HEIC photo thumbnail)
 #   columns.png  Miller columns
 #
+# plus one capture per scripts/visual-scenarios/<name>.json (format in
+# scripts/visual-scenario.py): a UI feature adds a scenario so its look is
+# captured on every later run too. <output-dir>/captures.txt lists every
+# capture with its description.
+#
+# VISUAL_WINDOW_ONLY=1 is for unattended runs (the factory): Haven launches in
+# the background with HAVEN_CAPTURE=1 (it never takes focus; its window floats
+# above other apps, ignoring clicks, so it keeps redrawing) and only
+# <name>.png of the window alone is captured, so nothing else on screen is
+# ever recorded. The sidebar luminance check, which needs the composite over
+# the desktop, is skipped.
+#
+# VISUAL_ROOT=<checkout> builds and captures that checkout (its code and its
+# scenarios) with this copy of the script and helpers. The factory uses it to
+# judge a job's worktree with the main checkout's checker.
+#
 # Each scenario also gets <name>.window.png, the window alone (never covered
 # by other apps, but without the desktop behind the blur). If another app's
 # window covers Haven when capturing, the composited capture is retried and
@@ -32,13 +48,21 @@
 # bundle is already running (a leftover from an earlier run).
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${VISUAL_ROOT:-${SCRIPT_DIR}/..}" && pwd)"
 OUT_DIR="${1:-${ROOT_DIR}/target/visual}"
 APP="${ROOT_DIR}/target/bundle/Haven.app"
-HELPER="${ROOT_DIR}/scripts/haven-window.swift"
+HELPER="${SCRIPT_DIR}/haven-window.swift"
+SCENARIO_TOOL="${SCRIPT_DIR}/visual-scenario.py"
+SCENARIO_DIR="${VISUAL_SCENARIOS:-${ROOT_DIR}/scripts/visual-scenarios}"
 # WCAG relative luminance of the sidebar background. White text needs <= ~0.18
 # for 4.5:1 contrast; keep headroom for the dimmer section labels.
 SIDEBAR_MAX_LUMA="${SIDEBAR_MAX_LUMA:-0.12}"
+WINDOW_ONLY="${VISUAL_WINDOW_ONLY:-0}"
+OPEN_FLAGS=(-n)
+# HAVEN_CAPTURE=1: Haven never activates itself and floats its window above
+# other apps without taking focus or clicks, so gpui keeps drawing it.
+[[ "${WINDOW_ONLY}" == 1 ]] && OPEN_FLAGS=(-n -g --env HAVEN_CAPTURE=1)
 
 EXE="${APP}/Contents/MacOS/haven"
 if pgrep -f "${EXE}" >/dev/null; then
@@ -49,6 +73,7 @@ fi
 
 PROFILE="${PROFILE:-debug}" "${ROOT_DIR}/scripts/bundle-macos.sh" >/dev/null
 mkdir -p "${OUT_DIR}"
+rm -f "${OUT_DIR}"/*.png "${OUT_DIR}/captures.txt"
 
 FIXTURE="$(mktemp -d /tmp/haven-visual.XXXXXX)"
 mkdir -p "${FIXTURE}/src" "${FIXTURE}/docs" "${FIXTURE}/assets"
@@ -76,18 +101,28 @@ quit_ours() {
 }
 trap 'for p in $(pgrep -f "${EXE}"); do quit_ours "${p}"; done' EXIT
 
-capture() {
-    local name="$1" view="$2"
-    shift 2
-    # Pin the fixture's folders on the start page instead of the default
-    # ~/Desktop, ~/Documents and ~/Downloads. Those are privacy-protected, and
-    # the first launch of a freshly built (ad-hoc signed) bundle can take
-    # seconds to stat them while macOS evaluates the new signature, so
-    # start.png raced the pins and showed the empty placeholder. Fixture pins
-    # load at once and keep the owner's folders out of the captures.
+# Pin the fixture's folders on the start page instead of the default
+# ~/Desktop, ~/Documents and ~/Downloads. Those are privacy-protected, and the
+# first launch of a freshly built (ad-hoc signed) bundle can take seconds to
+# stat them while macOS evaluates the new signature, so start.png raced the
+# pins and showed the empty placeholder. Fixture pins load at once and keep the
+# owner's folders out of the captures.
+default_state() {
     printf '{"default_view":"%s","start_pins":["%s/docs","%s/src","%s/assets"],"session":{"tabs":[null],"active":0}}\n' \
-        "${view}" "${FIXTURE}" "${FIXTURE}" "${FIXTURE}" >"${STATE}/state.json"
-    open -n --env "HAVEN_STATE_DIR=${STATE}" "${APP}" --args "$@"
+        "$1" "${FIXTURE}" "${FIXTURE}" "${FIXTURE}" >"${STATE}/state.json"
+}
+
+# capture <name> [KEY=VALUE ...] -- [args ...]   (state.json written first)
+capture() {
+    local name="$1"
+    shift
+    local envs=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do
+        envs+=(--env "$1")
+        shift
+    done
+    [[ $# -gt 0 ]] && shift
+    open "${OPEN_FLAGS[@]}" --env "HAVEN_STATE_DIR=${STATE}" ${envs[@]+"${envs[@]}"} "${APP}" --args "$@"
     local pid=""
     for _ in $(seq 1 50); do
         pid="$(pgrep -n -f "${EXE}" || true)"
@@ -100,6 +135,12 @@ capture() {
     info="$(swift "${HELPER}" bounds "${pid}")"
     wid="${info%% *}"
     bounds="${info#* }"
+    if [[ "${WINDOW_ONLY}" == 1 ]]; then
+        screencapture -x -o -l "${wid}" "${OUT_DIR}/${name}.png"
+        quit_ours "${pid}"
+        echo "${bounds}"
+        return 0
+    fi
     screencapture -x -o -l "${wid}" "${OUT_DIR}/${name}.window.png"
     rm -f "${OUT_DIR}/${name}.png"
     for _ in 1 2 3; do
@@ -117,15 +158,23 @@ capture() {
 }
 
 status=0
-for scenario in "start List" "list List ${FIXTURE}" "grid Grid ${FIXTURE}" "columns Columns ${FIXTURE}"; do
-    # shellcheck disable=SC2086
-    set -- ${scenario}
-    name="$1"
-    bounds="$(capture "$@")"
+# check <name> <bounds> <check-sidebar 1|0> <description>
+check() {
+    local name="$1" bounds="$2" check_sidebar="$3" desc="$4"
+    printf '%s\t%s\n' "${name}" "${desc}" >>"${OUT_DIR}/captures.txt"
+    if [[ "${WINDOW_ONLY}" == 1 ]]; then
+        printf '%-8s %s  window only\n' "${name}" "${OUT_DIR}/${name}.png"
+        [[ -f "${OUT_DIR}/${name}.png" ]] || { echo "error: no capture for ${name}" >&2; status=1; }
+        return 0
+    fi
     if [[ ! -f "${OUT_DIR}/${name}.png" ]]; then
         printf '%-8s %s  SKIPPED composite (another window covered Haven); layout only\n' \
             "${name}" "${OUT_DIR}/${name}.window.png"
-        continue
+        return 0
+    fi
+    if [[ "${check_sidebar}" != 1 ]]; then
+        printf '%-8s %s  sidebar check off for this scenario\n' "${name}" "${OUT_DIR}/${name}.png"
+        return 0
     fi
     w="$(cut -d, -f3 <<<"${bounds}")"
     h="$(cut -d, -f4 <<<"${bounds}")"
@@ -141,7 +190,34 @@ for scenario in "start List" "list List ${FIXTURE}" "grid Grid ${FIXTURE}" "colu
         status=1
     fi
     printf '%-8s %s  sidebar luminance %s  %s\n' "${name}" "${OUT_DIR}/${name}.png" "${luma}" "${verdict}"
+}
+
+for scenario in "start List Start page: pinned fixture folders, drives, recents" \
+    "list List List view: Date, Size and Kind under their headers, rows full width" \
+    "grid Grid Grid view: icons and the HEIC thumbnail, labels truncated with …" \
+    "columns Columns Columns view: Miller columns, rows full width"; do
+    read -r name view desc <<<"${scenario}"
+    default_state "${view}"
+    if [[ "${name}" == start ]]; then
+        bounds="$(capture "${name}" --)"
+    else
+        bounds="$(capture "${name}" -- "${FIXTURE}")"
+    fi
+    check "${name}" "${bounds}" 1 "${desc}"
 done
+
+if [[ -d "${SCENARIO_DIR}" ]]; then
+    for file in "${SCENARIO_DIR}"/*.json; do
+        [[ -e "${file}" ]] || continue
+        launch="${STATE}/launch"
+        python3 "${SCENARIO_TOOL}" "${file}" "${FIXTURE}" "${STATE}/state.json" >"${launch}" || exit 2
+        fields=()
+        while IFS= read -r -d '' f; do fields+=("${f}"); done <"${launch}"
+        name="${fields[0]}"
+        bounds="$(capture "${name}" "${fields[@]:3}")"
+        check "${name}" "${bounds}" "${fields[1]}" "${fields[2]}"
+    done
+fi
 
 rm -rf "${STATE}"
 echo "fixture: ${FIXTURE}"

@@ -19,6 +19,8 @@
     factory/bin/job move <id> <stage>    low-level move, still checked against TRANSITIONS
     factory/bin/job cost <id>            recompute cost from subagent transcripts
     factory/bin/job check <id>           run checks.sh in the job's worktree (read-only; for the builder)
+    factory/bin/job visual <id>          run visual.sh in the job's worktree into visual-preview/
+                                         (no state change; for the builder)
 
 `next` prints exactly one of:
     <id> <stage> SPAWN <agent>:<model>[:<effort>] [<agent>:<model>[:<effort>] ...] [out=<file>,...]
@@ -416,8 +418,11 @@ def gh_pr(config, job, *args, check=True):
     return F.run(cmd, cwd=F.ROOT, check=check)
 
 
-def run_gate(job, out_name):
-    p = F.run([str(HERE / "gate"), job["worktree"], job["base"], str(jpath(job, out_name))], cwd=F.ROOT)
+def run_gate(job, out_name, visual_dir=None):
+    args = [str(HERE / "gate"), job["worktree"], job["base"], str(jpath(job, out_name))]
+    if visual_dir:
+        args += ["--visual", str(jpath(job, visual_dir))]
+    p = F.run(args, cwd=F.ROOT)
     line = (p.stdout.strip().splitlines() or ["FAIL gate crashed: " + p.stderr.strip()[-300:]])[-1]
     return p.returncode == 0, line
 
@@ -516,7 +521,8 @@ def step(config, job):
             push_and_pr(config, job)
         except RuntimeError as e:
             return "ERROR %s: push/PR failed: %s" % (job["id"], str(e)[:300])
-        ok, line = run_gate(job, "gate-%d.md" % job["round"])
+        visual = ("visual-%d" % job["round"]) if F.needs_visual(config, job) else None
+        ok, line = run_gate(job, "gate-%d.md" % job["round"], visual_dir=visual)
         job["verdicts"]["gate"][str(job["round"])] = "PASS" if ok else "FAIL"
         if not ok:
             return next_round(config, job, "gate %s" % line)
@@ -769,6 +775,23 @@ def cmd_check(job):
     return 0 if p.returncode == 0 else 1
 
 
+def cmd_visual(config, job):
+    """Run factory/visual.sh in the job worktree into <job>/visual-preview/. Changes no
+    state; lets the builder look at its captures before the gate makes the real ones."""
+    wt = job.get("worktree")
+    if not wt or not Path(wt).is_dir():
+        print("ERROR %s has no worktree" % job["id"])
+        return 1
+    out = jpath(job, "visual-preview")
+    code, log = F.run_visual(config, wt, out)
+    print("\n".join(log.rstrip().splitlines()[-40:]))
+    for name, desc in F.visual_captures(out):
+        print("capture %s: %s" % (out / (name + ".png"), desc))
+    ok = code == 0
+    print("VISUAL %s (%s)" % ("PASS" if ok else "FAIL", "timeout" if code is None else "exit %d" % code))
+    return 0 if ok else 1
+
+
 # ---------------- cost ----------------
 
 def project_slug(path):
@@ -882,6 +905,8 @@ def main(argv):
             print(cmd_pick(config, args[0]))
         elif cmd == "check" and len(args) == 1:
             return cmd_check(load(args[0]))
+        elif cmd == "visual" and len(args) == 1:
+            return cmd_visual(config, load(args[0]))
         elif cmd in ("next", "feedback", "reject", "approve", "merge", "move", "cost", "retry") and args:
             jid = args[0]
             if cmd in ("next", "feedback", "approve", "merge"):
