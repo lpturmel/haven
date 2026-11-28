@@ -63,6 +63,18 @@ a command that isn't pre-approved is simply denied. So:
   `PYTHONDONTWRITEBYTECODE=1`. Never leave a `__pycache__/` directory in the
   worktree.
 - To mark a script executable, `chmod +x <absolute path>`.
+- **UI jobs** (`surfaces` has `ui`): the gate builds your branch, launches it
+  and screenshots it, and the ui-reviewer judges those screenshots. It's the
+  only visual validation before merge. Add or extend a scenario in
+  `<worktree>/scripts/visual-scenarios/<name>.json` (format at the top of
+  `scripts/visual-scenario.py`) for every visible behaviour the spec names, so
+  a capture shows it. Keep the scenarios: they become regression shots for
+  later jobs. To see your captures before you finish, run exactly
+  `factory/bin/job visual <job-id>`: it ends with `VISUAL PASS` or
+  `VISUAL FAIL`, prints each capture's path, and changes no job state. Open
+  the PNGs with the Read tool. Don't edit `scripts/visual-check.sh`,
+  `scripts/visual-scenario.py` or `scripts/haven-window.swift` to make a
+  capture pass: the gate uses the main checkout's copies.
 - If you can't finish (spec contradiction, missing access), commit what is
   sound and say exactly what blocks you in your build file.
 
@@ -85,7 +97,8 @@ Write exactly one file, the `Write:` path (`<folder>/build-<n>.md`):
 
 ## Checks
 
-<result of checks.sh, and anything not verified>
+<result of checks.sh; for UI jobs the scenarios you added and what the
+`job visual` captures showed; anything not verified>
 
 ## Notes for reviewers
 

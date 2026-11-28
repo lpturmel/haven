@@ -5,6 +5,7 @@ invoked from there, so ROOT is the main checkout even when the work happens in
 a job worktree.
 """
 import datetime
+import fcntl
 import json
 import os
 import re
@@ -201,6 +202,57 @@ def run(cmd, cwd=None, check=False, input=None, timeout=None, env=None):
 
 def git(*args, cwd=None, check=True):
     return run(["git"] + list(args), cwd=cwd or ROOT, check=check)
+
+
+# ---------- visual check ----------
+
+def visual_surfaces(config):
+    """Surfaces whose jobs get the visual check (config.json "visual.surfaces")."""
+    return list((config.get("visual") or {}).get("surfaces") or [])
+
+
+def needs_visual(config, job):
+    return bool(set(job.get("surfaces") or []) & set(visual_surfaces(config)))
+
+
+def run_visual(config, worktree, out_dir):
+    """Run the main checkout's factory/visual.sh in <worktree>, writing captures to
+    <out_dir>. One run at a time across jobs: they share the screen. Returns
+    (exit code, or None on timeout, log text)."""
+    script = FACTORY / "visual.sh"
+    if not script.exists():
+        return 127, "no factory/visual.sh in the main checkout\n"
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, FACTORY_WORKTREE=str(worktree), FACTORY_ROOT=str(ROOT),
+               PYTHONDONTWRITEBYTECODE="1")
+    timeout = int((config.get("visual") or {}).get("timeout_sec", 900))
+    JOBS.mkdir(parents=True, exist_ok=True)
+    with open(JOBS / ".visual.lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            p = subprocess.run(["bash", str(script), str(out_dir)], cwd=str(worktree), env=env,
+                               text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               timeout=timeout)
+            return p.returncode, p.stdout
+        except subprocess.TimeoutExpired as e:
+            out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+            return None, out
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def visual_captures(out_dir):
+    """[(name, description)] from <out_dir>/captures.txt, in capture order."""
+    f = Path(out_dir) / "captures.txt"
+    if not f.exists():
+        return []
+    rows = []
+    for line in f.read_text().splitlines():
+        name, _, desc = line.partition("\t")
+        if name:
+            rows.append((name, desc))
+    return rows
 
 
 def _git_dirs(cwd, *flags):

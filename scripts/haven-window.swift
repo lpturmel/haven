@@ -28,7 +28,8 @@ func bounds(pid: Int32) {
     var best: (Int, CGRect)? = nil
     for w in list {
         guard (w[kCGWindowOwnerPID as String] as? Int32) == pid,
-            (w[kCGWindowLayer as String] as? Int) == 0,
+            // 0: normal; 3: floating (HAVEN_CAPTURE=1 runs).
+            [0, 3].contains(w[kCGWindowLayer as String] as? Int ?? -1),
             let num = w[kCGWindowNumber as String] as? Int,
             let dict = w[kCGWindowBounds as String] as? NSDictionary,
             let rect = CGRect(dictionaryRepresentation: dict)

@@ -16,8 +16,15 @@
   "concurrency": 3,
   "max_rounds": 4,
   "gate_timeout_sec": 1800,
+  "visual": {
+    "surfaces": [
+      "ui"
+    ],
+    "timeout_sec": 900
+  },
   "protected_paths": [
     "factory/checks.sh",
+    "factory/visual.sh",
     "factory/config.json",
     "factory/bin/*",
     ".claude/agents/*",
@@ -55,8 +62,8 @@
     },
     {
       "name": "ui-reviewer",
-      "purpose": "Visual fit with the existing design.",
-      "model": "haiku",
+      "purpose": "Visual fit with the existing design, judged on the gate's captures.",
+      "model": "sonnet",
       "when": "ui"
     },
     {

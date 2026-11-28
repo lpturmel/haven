@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """gate: decide whether a job branch works. Scripts decide; agents don't.
 
-    factory/bin/gate <worktree> <base-ref> <out.md>
+    factory/bin/gate <worktree> <base-ref> <out.md> [--visual <dir>]
 
 1. Fails if the worktree has uncommitted changes (the builder must commit).
 2. Fails if the branch has no commits ahead of <base-ref>.
@@ -9,6 +9,9 @@
    config.protected_paths (fnmatch globs, relative to the repo root).
 4. Runs the MAIN checkout's factory/checks.sh with cwd=<worktree>, so a branch
    can't edit the checks it is judged by.
+5. With --visual <dir>, once the checks pass, runs the MAIN checkout's
+   factory/visual.sh in the worktree (tier-3 captures into <dir>). It fails
+   the gate when an automatic visual check fails or the captures can't be made.
 
 Writes <out.md> (## Summary + Result line) and <out>.log (full output).
 Prints one line "PASS" or "FAIL <reason>"; exit 0 on PASS, 1 on FAIL.
@@ -31,6 +34,10 @@ def protected_hits(worktree, base, patterns):
 
 
 def main(argv):
+    visual_dir = None
+    if len(argv) == 6 and argv[4] == "--visual":
+        visual_dir = Path(argv[5]).resolve()
+        argv = argv[:4]
     if len(argv) != 4:
         print(__doc__.strip())
         return 2
@@ -72,6 +79,19 @@ def main(argv):
             except subprocess.TimeoutExpired as e:
                 log = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
                 reason = "checks.sh timed out"
+    visual = None
+    if not reason and visual_dir:
+        code, vlog = F.run_visual(config, worktree, visual_dir)
+        log += "\n==> factory/visual.sh %s\n%s" % (visual_dir, vlog)
+        visual = F.visual_captures(visual_dir)
+        if code is None:
+            reason = "visual check timed out"
+        elif code == 1:
+            reason = "visual check failed"
+        elif code != 0:
+            reason = "visual check could not run (exit %d)" % code
+        elif not visual:
+            reason = "visual check wrote no captures"
 
     F.atomic_write(log_path, log)
     result = "FAIL" if reason else "PASS"
@@ -79,14 +99,26 @@ def main(argv):
     body = "## Verdict\n\nResult: %s\n" % result
     if detail:
         body += "\n" + "\n\n".join(detail) + "\n"
+    if visual:
+        rows = []
+        for name, desc in visual:
+            shots = [n for n in (name + ".png", name + ".window.png") if (visual_dir / n).exists()]
+            rows.append("- `%s`: %s (%s)" % (name, desc or "no description",
+                                              ", ".join("`%s/%s`" % (visual_dir.name, n) for n in shots)))
+        body += ("\n## Visual captures\n\nIn `%s/`, each the Haven window alone (no desktop behind "
+                 "the frosted sidebar).\n\n%s\n" % (visual_dir, "\n".join(rows)))
     if tail:
         body += "\n## Log tail\n\nFull log: `%s`\n\n```\n%s\n```\n" % (log_path.name, tail)
-    F.atomic_write(out, F.summary_md([
+    bullets = [
         "Gate %s for `%s` against `%s`" % (result, worktree.name, base),
         reason or "checks.sh passed, no protected paths touched",
         "checks: main checkout's `factory/checks.sh`",
         "full log: `%s` (%d lines)" % (log_path.name, len(log.splitlines())),
-    ], body))
+    ]
+    if visual_dir:
+        bullets.append("visual: %s" % ("%d capture(s) in `%s/`" % (len(visual or []), visual_dir.name)
+                                       if visual else "not captured"))
+    F.atomic_write(out, F.summary_md(bullets, body))
     print(result if not reason else "FAIL " + reason)
     return 1 if reason else 0
 

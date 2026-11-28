@@ -59,6 +59,14 @@ fn window_size() -> Option<(f32, f32)> {
     parse_size(&std::env::var("HAVEN_WINDOW_SIZE").ok()?)
 }
 
+/// `HAVEN_CAPTURE=1`: unattended screenshot runs (`scripts/visual-check.sh`
+/// with `VISUAL_WINDOW_ONLY=1`, the factory's visual gate). The app never
+/// activates itself and the window floats above other apps without taking
+/// focus or clicks, so captures are current and the owner's work is untouched.
+fn capture_mode() -> bool {
+    std::env::var("HAVEN_CAPTURE").as_deref() == Ok("1")
+}
+
 fn parse_size(s: &str) -> Option<(f32, f32)> {
     let (w, h) = s.trim().split_once(['x', 'X'])?;
     let (w, h): (f32, f32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
@@ -121,6 +129,10 @@ fn install_backdrop(window: &gpui::Window) {
         let ok = unsafe { haven_macos::install_sidebar_material(h.ns_view.as_ptr()) };
         if !ok {
             eprintln!("haven: could not install the sidebar material");
+        }
+        // SAFETY: same live content view, on the main thread.
+        if capture_mode() && !unsafe { haven_macos::float_for_capture(h.ns_view.as_ptr()) } {
+            eprintln!("haven: could not float the window for capture");
         }
     }
 }
@@ -311,7 +323,9 @@ fn main() {
             }
         })
         .detach();
-        cx.activate(true);
+        if !capture_mode() {
+            cx.activate(true);
+        }
     });
 }
 
