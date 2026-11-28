@@ -14,6 +14,7 @@ pub mod recents;
 pub mod sort;
 pub mod state;
 pub mod system;
+pub mod tabstrip;
 pub mod tags;
 pub mod volumes;
 pub mod watch;
