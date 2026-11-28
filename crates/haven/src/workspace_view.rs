@@ -3,12 +3,13 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, AppContext, Context, DragMoveEvent, Empty, FontWeight, InteractiveElement,
+    AnyElement, App, AppContext, Context, DragMoveEvent, Empty, FontWeight, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, TextRun, Window, canvas, deferred, div,
+    StatefulInteractiveElement, Styled, TextRun, Window, canvas, deferred, div, point,
     prelude::FluentBuilder, px, relative,
 };
 use haven_core::state::ViewMode;
+use haven_core::tabstrip;
 use haven_core::{TagColor, fmt, home_dir};
 
 use crate::actions::*;
@@ -35,6 +36,24 @@ const CHEVRON_W: f32 = 11.;
 const FILTER_W: f32 = 190.;
 const FILTER_W_NARROW: f32 = 130.;
 const NARROW_CONTENT_W: f32 = 760.;
+
+/// Window layout around the main card, used by `render` and to work out the
+/// tab strip's width in the same frame.
+const SPLITTER_W: f32 = 4.;
+/// The card's padding to the window edge (left only when the sidebar is
+/// hidden; top, right and bottom always).
+const CARD_PAD: f32 = 6.;
+/// The card's border (`border_1`), on each side.
+const CARD_BORDER: f32 = 1.;
+/// Tab strip metrics: its horizontal padding, the left inset that clears the
+/// traffic lights when the sidebar is hidden, the gap between items, the "+"
+/// button's width (`icon_button`), and each tab's width range.
+const TAB_STRIP_PAD: f32 = 8.;
+const TRAFFIC_LIGHT_INSET: f32 = 80.;
+const TAB_GAP: f32 = 4.;
+const NEW_TAB_W: f32 = 26.;
+const TAB_MIN_W: f32 = 100.;
+const TAB_MAX_W: f32 = 200.;
 
 #[derive(Clone)]
 pub struct SidebarSplitter;
@@ -477,8 +496,49 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// Inner width of the tab strip (inside its padding), from the window
+    /// size and the layout in `render`: sidebar + splitter (or the card's
+    /// left pad), the card's right pad and border, then the strip padding.
+    fn tab_strip_inner_width(&self, window: &Window, cx: &App) -> f32 {
+        let left = if self.sidebar_visible {
+            Store::get(cx).sidebar_width + SPLITTER_W
+        } else {
+            CARD_PAD
+        };
+        let strip_pad = if self.sidebar_visible {
+            TAB_STRIP_PAD + TAB_STRIP_PAD
+        } else {
+            TRAFFIC_LIGHT_INSET + TAB_STRIP_PAD
+        };
+        f32::from(window.viewport_size().width) - left - CARD_PAD - CARD_BORDER * 2. - strip_pad
+    }
+
+    fn render_tab_strip(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = theme(cx).clone();
+        let n = self.tabs.len();
+        // The room `n` tabs and the trailing spacer shared when the tabs
+        // were `flex_1`: the strip minus "+" and the `n + 1` gaps.
+        let inner = self.tab_strip_inner_width(window, cx);
+        let free = inner - NEW_TAB_W - (n as f32 + 1.) * TAB_GAP;
+        let tab_w = tabstrip::tab_width(free, n, TAB_MIN_W, TAB_MAX_W);
+        // Scroll the active tab into view once per request (activation or a
+        // tab-list change) or when the viewport changes width (resize,
+        // sidebar toggle); never on every render, so wheel scrolling sticks.
+        let viewport_w = tabstrip::viewport_width(inner, n, tab_w, TAB_GAP, NEW_TAB_W);
+        let resized = (viewport_w - self.tab_viewport_w).abs() > 0.5;
+        self.tab_viewport_w = viewport_w;
+        if std::mem::take(&mut self.tab_reveal) || resized {
+            let offset = self.tab_scroll.offset();
+            let x = tabstrip::reveal_offset(
+                f32::from(offset.x),
+                self.active,
+                n,
+                tab_w,
+                TAB_GAP,
+                viewport_w,
+            );
+            self.tab_scroll.set_offset(point(px(x), offset.y));
+        }
         let tabs: Vec<AnyElement> = self
             .tabs
             .iter()
@@ -496,10 +556,10 @@ impl Workspace {
                 div()
                     .id(("tab", i))
                     .group("tab")
+                    .when(active, |d| d.debug_selector(|| "tab-active".into()))
                     .h(px(28.))
-                    .min_w(px(100.))
-                    .max_w(px(200.))
-                    .flex_1()
+                    .w(px(tab_w))
+                    .flex_none()
                     // 6 on the right leaves the title as wide as it was
                     // with the old 16px close button (now 20px).
                     .pl(px(10.))
@@ -561,13 +621,14 @@ impl Workspace {
             .collect();
         div()
             .id("tab-strip")
+            .debug_selector(|| "tab-strip".into())
             .h(px(40.))
             .flex_none()
             .flex()
             .items_center()
-            .gap(px(4.))
-            .px(px(8.))
-            .when(!self.sidebar_visible, |d| d.pl(px(80.)))
+            .gap(px(TAB_GAP))
+            .px(px(TAB_STRIP_PAD))
+            .when(!self.sidebar_visible, |d| d.pl(px(TRAFFIC_LIGHT_INSET)))
             .on_mouse_down(MouseButton::Left, |ev, window, _| {
                 if ev.click_count == 2 {
                     window.titlebar_double_click();
@@ -575,10 +636,31 @@ impl Workspace {
                     window.start_window_move();
                 }
             })
-            .children(tabs)
-            .child(icon_button("new-tab", "plus", cx).on_click(
-                cx.listener(|ws, _, window, cx| ws.add_tab(Location::Start, true, window, cx)),
-            ))
+            .child(
+                // Only the tabs scroll (a vertical wheel scrolls them
+                // sideways); "+" stays put. Shrinks once the tabs are at
+                // their minimum width, never grows past them, so empty strip
+                // space keeps dragging the window.
+                div()
+                    .id("tab-scroll")
+                    .debug_selector(|| "tab-scroll".into())
+                    .flex()
+                    .items_center()
+                    .gap(px(TAB_GAP))
+                    .flex_initial()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.tab_scroll)
+                    .children(tabs),
+            )
+            .child(
+                icon_button("new-tab", "plus", cx)
+                    .debug_selector(|| "new-tab".into())
+                    .flex_none()
+                    .on_click(cx.listener(|ws, _, window, cx| {
+                        ws.add_tab(Location::Start, true, window, cx)
+                    })),
+            )
             .child(div().flex_1())
             .into_any_element()
     }
@@ -1245,7 +1327,7 @@ impl Render for Workspace {
         }
         let t = theme(cx).clone();
         let sidebar = self.sidebar_visible.then(|| self.render_sidebar(cx));
-        let tab_strip = self.render_tab_strip(cx);
+        let tab_strip = self.render_tab_strip(window, cx);
         let toolbar = self.render_toolbar(window, cx);
         let status = self.render_status(cx);
         let hud = self.render_hud(cx);
@@ -1423,7 +1505,7 @@ impl Render for Workspace {
                 d.child(
                     div()
                         .id("sidebar-splitter")
-                        .w(px(4.))
+                        .w(px(SPLITTER_W))
                         .h_full()
                         .flex_none()
                         .cursor_col_resize()
@@ -1435,10 +1517,10 @@ impl Render for Workspace {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .pt(px(6.))
-                    .pr(px(6.))
-                    .pb(px(6.))
-                    .when(!self.sidebar_visible, |d| d.pl(px(6.)))
+                    .pt(px(CARD_PAD))
+                    .pr(px(CARD_PAD))
+                    .pb(px(CARD_PAD))
+                    .when(!self.sidebar_visible, |d| d.pl(px(CARD_PAD)))
                     .child(
                         div()
                             .size_full()

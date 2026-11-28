@@ -73,6 +73,14 @@ pub struct Workspace {
     pub crumbs_width: f32,
     /// Which leading crumbs the last frame collapsed into "…".
     pub crumbs_hidden: std::ops::Range<usize>,
+    /// Horizontal scroll of the tab strip's tabs (they scroll once they
+    /// reach their minimum width).
+    pub tab_scroll: gpui::ScrollHandle,
+    /// The next frame scrolls the active tab into view (`reveal_active_tab`).
+    pub tab_reveal: bool,
+    /// The tab viewport's width in the last frame: when it changes (window
+    /// resize, sidebar toggle) the active tab is brought back into view.
+    pub tab_viewport_w: f32,
     watcher: Option<DirWatcher>,
     overlay_subs: Vec<Subscription>,
     /// Dialogs that arrived from background work (a transfer's conflict
@@ -202,6 +210,9 @@ impl Workspace {
             seen_preview_visible: Store::get(cx).preview_visible,
             crumbs_width: 0.,
             crumbs_hidden: 0..0,
+            tab_scroll: gpui::ScrollHandle::new(),
+            tab_reveal: false,
+            tab_viewport_w: 0.,
             watcher,
             overlay_subs: Vec::new(),
             queued_overlays: Default::default(),
@@ -315,6 +326,10 @@ impl Workspace {
             // Inserted before the active tab: keep pointing at the same tab.
             self.active += 1;
         }
+        if !activate {
+            // Tab widths may shrink: keep the active tab in view.
+            self.reveal_active_tab();
+        }
         self.save_session(cx);
         cx.notify();
     }
@@ -324,6 +339,7 @@ impl Workspace {
             return;
         }
         self.active = ix;
+        self.reveal_active_tab();
         self.end_path_edit(false, window, cx);
         let filter = self.tabs[ix].read(cx).filter.clone();
         self.filter_field
@@ -332,6 +348,19 @@ impl Workspace {
         window.focus(&focus);
         self.save_session(cx);
         cx.notify();
+    }
+
+    /// Scrolls the tab strip so the active tab is fully visible. Called only
+    /// when the active tab or the tab list changes, never on every render, so
+    /// the user's own scrolling sticks.
+    ///
+    /// The next render works out the offset from the strip's geometry
+    /// (`render_tab_strip`). gpui's own `ScrollHandle::scroll_to_item` isn't
+    /// used: it measures against the viewport's bounds and overflow from the
+    /// frame before, so it does nothing on the first frame (a restored active
+    /// tab stays hidden) and misses when the window was just resized.
+    pub fn reveal_active_tab(&mut self) {
+        self.tab_reveal = true;
     }
 
     pub fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2024,6 +2053,232 @@ mod tests {
         draw(cx);
         assert!(hidden(&ws, cx).is_empty());
         fits(cx);
+    }
+
+    /// Draws twice, as the crumbs test does, so bounds reflect a settled
+    /// layout.
+    fn draw2(cx: &mut VisualTestContext) {
+        draw(cx);
+        draw(cx);
+    }
+
+    fn bounds(cx: &mut VisualTestContext, sel: &'static str) -> gpui::Bounds<Pixels> {
+        cx.debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} drawn"))
+    }
+
+    /// The active tab lies fully inside the tab strip's scroll viewport.
+    #[track_caller]
+    fn assert_active_tab_in_view(cx: &mut VisualTestContext, what: &str) {
+        let scroll = bounds(cx, "tab-scroll");
+        let tab = bounds(cx, "tab-active");
+        assert!(
+            tab.left() >= scroll.left() - px(0.5) && tab.right() <= scroll.right() + px(0.5),
+            "{what}: active tab {tab:?} not inside {scroll:?}"
+        );
+    }
+
+    /// A window at `size` with `n` start-page tabs, the last one active.
+    fn open_tabs(
+        cx: &mut TestAppContext,
+        n: usize,
+        size: (f32, f32),
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let (ws, cx) = open(cx, Location::Start);
+        cx.simulate_resize(gpui::size(px(size.0), px(size.1)));
+        ws.update_in(cx, |ws, window, cx| {
+            for _ in 1..n {
+                ws.add_tab(Location::Start, true, window, cx);
+            }
+        });
+        cx.update(|window, _| window.activate_window());
+        draw2(cx);
+        (ws, cx)
+    }
+
+    #[gpui::test]
+    async fn tab_strip_fits_like_before(cx: &mut TestAppContext) {
+        init(cx);
+        let (ws, cx) = open_tabs(cx, 3, (3000., 800.));
+        assert_eq!(ws.read_with(cx, |ws, _| ws.active), 2);
+        let tab = bounds(cx, "tab-active");
+        let plus = bounds(cx, "new-tab");
+        assert!(
+            (tab.size.width - px(200.)).abs() < px(0.5),
+            "tabs at their max width: {tab:?}"
+        );
+        assert!(
+            (plus.left() - (tab.right() + px(4.))).abs() < px(0.5),
+            "\"+\" right after the last tab: {plus:?} vs {tab:?}"
+        );
+        let max = ws.read_with(cx, |ws, _| ws.tab_scroll.max_offset());
+        assert_eq!(max.width, px(0.), "nothing to scroll");
+    }
+
+    #[gpui::test]
+    async fn tab_strip_shares_room_like_before(cx: &mut TestAppContext) {
+        init(cx);
+        // 1000pt: the strip inside the sidebar, card and padding is
+        // 1000 - 224 - 6 - 2 - 16 = 752; 5 tabs share 752 - 26 - 6 × 4 = 702
+        // with the spacer, 117pt each, as the old flex_1 tabs did.
+        let (_ws, cx) = open_tabs(cx, 5, (1000., 700.));
+        let tab = bounds(cx, "tab-active");
+        assert!(
+            (tab.size.width - px(702. / 6.)).abs() < px(0.5),
+            "tabs share the room: {tab:?}"
+        );
+        let plus = bounds(cx, "new-tab");
+        assert!((plus.left() - (tab.right() + px(4.))).abs() < px(0.5));
+    }
+
+    #[gpui::test]
+    async fn tab_strip_scrolls_with_many_tabs(cx: &mut TestAppContext) {
+        init(cx);
+        let (ws, cx) = open_tabs(cx, 20, (900., 560.));
+        let strip = bounds(cx, "tab-strip");
+        let scroll = bounds(cx, "tab-scroll");
+        let plus = bounds(cx, "new-tab");
+        assert!(
+            strip.right() <= px(900.),
+            "strip inside the window: {strip:?}"
+        );
+        assert!(
+            plus.left() >= strip.left() && plus.right() <= strip.right(),
+            "\"+\" inside the strip: {plus:?} in {strip:?}"
+        );
+        assert!(plus.left() >= scroll.right(), "\"+\" right of the tabs");
+        assert!(ws.read_with(cx, |ws, _| ws.tab_scroll.max_offset().width) > px(0.));
+        assert_active_tab_in_view(cx, "after opening 20 tabs");
+
+        ws.update_in(cx, |ws, window, cx| ws.activate(0, window, cx));
+        draw2(cx);
+        assert_active_tab_in_view(cx, "first tab");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.tab_scroll.offset().x), px(0.));
+
+        cx.simulate_keystrokes("cmd-9");
+        draw2(cx);
+        assert_eq!(ws.read_with(cx, |ws, _| ws.active), 19);
+        assert_active_tab_in_view(cx, "cmd-9");
+
+        cx.simulate_keystrokes("cmd-shift-]");
+        draw2(cx);
+        assert_eq!(ws.read_with(cx, |ws, _| ws.active), 0, "wraps around");
+        assert_active_tab_in_view(cx, "next tab wraps to the first");
+
+        cx.simulate_keystrokes("cmd-shift-[");
+        draw2(cx);
+        assert_eq!(ws.read_with(cx, |ws, _| ws.active), 19, "wraps back");
+        assert_active_tab_in_view(cx, "previous tab wraps to the last");
+
+        ws.update_in(cx, |ws, window, cx| ws.activate(10, window, cx));
+        draw2(cx);
+        ws.update_in(cx, |ws, window, cx| ws.close_tab(10, window, cx));
+        draw2(cx);
+        assert_active_tab_in_view(cx, "after closing a tab");
+        ws.update_in(cx, |ws, window, cx| ws.reopen_closed(window, cx));
+        draw2(cx);
+        assert_eq!(ws.read_with(cx, |ws, _| ws.tabs.len()), 20);
+        assert_active_tab_in_view(cx, "reopened tab");
+
+        for ix in 0..20 {
+            ws.update_in(cx, |ws, window, cx| ws.activate(ix, window, cx));
+            draw2(cx);
+            assert_active_tab_in_view(cx, &format!("tab {ix}"));
+        }
+    }
+
+    #[gpui::test]
+    async fn tab_strip_keeps_restored_active_tab_in_view(cx: &mut TestAppContext) {
+        init(cx);
+        let locs = vec![Location::Start; 20];
+        let (_ws, cx) = cx.add_window_view(|window, cx| Workspace::new(locs, 19, window, cx));
+        cx.simulate_resize(gpui::size(px(900.), px(560.)));
+        draw2(cx);
+        assert_active_tab_in_view(cx, "restored active tab");
+    }
+
+    #[gpui::test]
+    async fn tab_strip_open_in_tabs_keeps_active_tab_in_view(cx: &mut TestAppContext) {
+        init(cx);
+        let root = fixture();
+        let (ws, cx) = open_tabs(cx, 18, (900., 560.));
+        ws.update_in(cx, |ws, window, cx| ws.activate(17, window, cx));
+        draw2(cx);
+        // Open in New Tab inserts after the active tab without activating.
+        ws.update_in(cx, |ws, _, cx| {
+            ws.active_tab().clone().update(cx, |_, cx| {
+                cx.emit(TabEvent::OpenInTabs(vec![
+                    root.join("projects"),
+                    root.join("projects/haven"),
+                ]))
+            })
+        });
+        cx.run_until_parked();
+        draw2(cx);
+        assert_eq!(
+            ws.read_with(cx, |ws, _| (ws.active, ws.tabs.len())),
+            (17, 20)
+        );
+        assert_active_tab_in_view(cx, "after Open in New Tab");
+    }
+
+    #[gpui::test]
+    async fn tab_strip_wheel_scroll_survives_rerender(cx: &mut TestAppContext) {
+        init(cx);
+        let (ws, cx) = open_tabs(cx, 20, (900., 560.));
+        ws.update_in(cx, |ws, window, cx| ws.activate(0, window, cx));
+        draw2(cx);
+        assert_eq!(ws.read_with(cx, |ws, _| ws.tab_scroll.offset().x), px(0.));
+        let scroll = bounds(cx, "tab-scroll");
+        let at = scroll.center();
+        cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-300.))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        draw(cx);
+        let scrolled = ws.read_with(cx, |ws, _| ws.tab_scroll.offset().x);
+        assert!(scrolled < px(0.), "wheel scrolled the tabs: {scrolled:?}");
+        // An unrelated re-render (job ticker, toast, reload) keeps it.
+        ws.update(cx, |_, cx| cx.notify());
+        draw2(cx);
+        assert_eq!(ws.read_with(cx, |ws, _| ws.tab_scroll.offset().x), scrolled);
+
+        // A tab scrolled into view takes clicks: the one under the
+        // viewport's right end was hidden before the scroll.
+        let target = gpui::point(scroll.right() - px(10.), scroll.center().y);
+        cx.simulate_click(target, gpui::Modifiers::none());
+        draw2(cx);
+        let active = ws.read_with(cx, |ws, _| ws.active);
+        assert!(active > 5, "clicked a scrolled-in tab, got {active}");
+        assert_active_tab_in_view(cx, "clicked tab");
+        // (Clicking "+" can't be simulated: its mouse-down also reaches the
+        // strip's window-drag handler, which the test platform doesn't
+        // implement. `tab_strip_scrolls_with_many_tabs` checks it is inside
+        // the strip, right of the tabs.)
+    }
+
+    #[gpui::test]
+    async fn tab_strip_respects_traffic_light_inset(cx: &mut TestAppContext) {
+        init(cx);
+        let (ws, cx) = open_tabs(cx, 20, (900., 560.));
+        ws.update(cx, |ws, cx| {
+            ws.sidebar_visible = false;
+            cx.notify();
+        });
+        draw2(cx);
+        let strip = bounds(cx, "tab-strip");
+        let scroll = bounds(cx, "tab-scroll");
+        let plus = bounds(cx, "new-tab");
+        assert!(
+            scroll.left() >= strip.left() + px(80. - 0.5),
+            "tabs clear the traffic lights: {scroll:?} in {strip:?}"
+        );
+        assert!(plus.right() <= strip.right());
+        assert!(strip.right() <= px(900.));
+        assert_active_tab_in_view(cx, "sidebar hidden");
     }
 
     #[gpui::test]
