@@ -1,0 +1,932 @@
+#!/usr/bin/env python3
+"""job: the factory's spine. The ONLY writer of factory/jobs/<id>/job.json.
+
+    factory/bin/job sync                 start jobs from the backlog (up to concurrency),
+                                         then print "<id> <stage>" for every open job
+    factory/bin/job next <id>            do the deterministic step for the job's stage and
+                                         print ONE line saying what the orchestrator does next
+    factory/bin/job list [--all]         "<id> <stage> r<round> <note>" per job
+    factory/bin/job show <id> [field]    print job.json (or one top-level field)
+    factory/bin/job new <ref>            create a job for one backlog ref
+    factory/bin/job pick <id|ref>        resolve one job by id or backlog ref; create it from a
+                                         ready backlog item (ignores concurrency); print "<id> <stage>"
+    factory/bin/job feedback <id>        stdin = the human's words -> feedback-<k>.md (+ new round)
+    factory/bin/job approve <id>         human approval of a needs-human job -> merge
+    factory/bin/job reject <id>          stdin = reason -> comment, close PR, stage rejected
+    factory/bin/job retry <id>           forget spawn counts for out files that are still
+                                         missing, so `next` spawns their agents again
+    factory/bin/job merge <id>           sync with base, gate again, merge (stage merging)
+    factory/bin/job move <id> <stage>    low-level move, still checked against TRANSITIONS
+    factory/bin/job cost <id>            recompute cost from subagent transcripts
+    factory/bin/job check <id>           run checks.sh in the job's worktree (read-only; for the builder)
+
+`next` prints exactly one of:
+    <id> <stage> SPAWN <agent>:<model>[:<effort>] [<agent>:<model>[:<effort>] ...] [out=<file>,...]
+    <id> <stage> WAIT <author|human> <note>
+    <id> <stage> DONE <merged|rejected>
+    ERROR <id>: <agent> did not write <file>[; <agent> did not write <file> ...]
+        (an out file was asked for MAX_SPAWNS times and still does not exist;
+         `next` goes on once the file exists, or after `job retry <id>`)
+    ERROR <message>
+"""
+import fcntl
+import glob
+import json
+import os
+import re
+import sys
+from contextlib import contextmanager
+import importlib.util
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(HERE))
+import factorylib as F  # noqa: E402
+
+_loader = SourceFileLoader("backlog", str(HERE / "backlog"))
+_spec = importlib.util.spec_from_loader("backlog", _loader)
+backlog = importlib.util.module_from_spec(_spec)
+_loader.exec_module(backlog)
+
+# The legal moves. Anything not listed here is refused.
+TRANSITIONS = {
+    "intake":      ["spec", "needs-info", "rejected"],
+    "needs-info":  ["intake", "rejected"],
+    "spec":        ["build", "rejected"],
+    "build":       ["gate", "needs-human", "rejected"],
+    "gate":        ["review", "build", "needs-human", "rejected"],
+    "review":      ["approve", "build", "needs-human", "rejected"],
+    "approve":     ["merging", "build", "needs-human", "rejected"],
+    "merging":     ["merged", "build", "needs-human", "rejected"],
+    "needs-human": ["build", "merging", "merged", "rejected"],
+    "merged":      [],
+    "rejected":    [],
+}
+TERMINAL = {"merged", "rejected"}
+WAITING = {"needs-info": "author", "needs-human": "human"}
+FIXED_ROLES = ["intake", "spec-writer", "builder", "approver"]
+# How many times `next` asks for a missing out file before it stops with ERROR.
+MAX_SPAWNS = 2
+
+
+class Refused(Exception):
+    pass
+
+
+# ---------------- storage ----------------
+
+def job_dir(jid):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", jid or ""):
+        F.die("bad job id %r" % jid)
+    return F.JOBS / jid
+
+
+def load(jid):
+    p = job_dir(jid) / "job.json"
+    if not p.exists():
+        F.die("no job %s" % jid)
+    return json.loads(p.read_text())
+
+
+def save(job):
+    job["updated_at"] = F.now()
+    F.atomic_write_json(job_dir(job["id"]) / "job.json", job)
+
+
+@contextmanager
+def locked(jid):
+    d = job_dir(jid)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / ".lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+@contextmanager
+def merge_lock():
+    F.JOBS.mkdir(parents=True, exist_ok=True)
+    with open(F.JOBS / ".merge.lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def all_jobs():
+    out = []
+    for p in sorted(F.JOBS.glob("*/job.json")):
+        try:
+            out.append(json.loads(p.read_text()))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return out
+
+
+def move(job, stage, note="", round_inc=False):
+    cur = job["stage"]
+    if stage not in TRANSITIONS.get(cur, []):
+        raise Refused("illegal move %s -> %s for %s" % (cur, stage, job["id"]))
+    if round_inc:
+        job["round"] += 1
+    job["stage"] = stage
+    job["waiting_on"] = WAITING.get(stage)
+    job["stage_entered_at"] = F.now()
+    job["note"] = note or stage
+    job["history"].append({"stage": stage, "at": job["stage_entered_at"], "round": job["round"], "note": note})
+    save(job)
+
+
+def issue_hash(path):
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest() if Path(path).exists() else None
+
+
+# ---------------- creation ----------------
+
+def job_id_for(config, ref):
+    base = ("gh-" if config.get("backlog") == "github" else "local-") + re.sub(r"[^a-z0-9]+", "-", ref.lower()).strip("-")
+    jid, n = base, 1
+    while (F.JOBS / jid).exists():
+        n += 1
+        jid = "%s-%d" % (base, n)
+    return jid
+
+
+def new_job(config, ref):
+    jid = job_id_for(config, ref)
+    d = job_dir(jid)
+    with locked(jid):
+        meta, text = backlog.fetch(config, ref)
+        F.atomic_write(d / "issue.md", text)
+        models = (config.get("models") or {}).get("agents") or {}
+        t = F.now()
+        base_branch = config.get("base_branch", "main")
+        job = {
+            "version": 1,
+            "id": jid,
+            "title": meta.get("title") or ref,
+            "stage": "intake",
+            "waiting_on": None,
+            "note": "created",
+            "issue": {k: meta.get(k) for k in ("source", "ref", "url", "file", "author")},
+            "risk": None,
+            "surfaces": [],
+            "models": {r: models.get(r, "fable" if r == "intake" else "opus") for r in FIXED_ROLES},
+            "reviewers": [],
+            "round": 0,
+            "max_rounds": int(config.get("max_rounds", 4)),
+            "branch": None,
+            "worktree": None,
+            "base": ("%s/%s" % (config.get("remote", "origin"), base_branch)) if config.get("merge", "pr") == "pr" else base_branch,
+            "pr": None,
+            "verdicts": {"intake": None, "gate": {}, "review": {}, "approve": {}, "merge_gate": {}},
+            "issue_hash": None,
+            "cost": None,
+            "created_at": t,
+            "updated_at": t,
+            "stage_entered_at": t,
+            "history": [{"stage": "intake", "at": t, "round": 0, "note": "created"}],
+        }
+        save(job)
+    return job
+
+
+def open_ref(ref):
+    for j in all_jobs():
+        if j["issue"].get("ref") == ref and j["stage"] not in TERMINAL:
+            return j
+    return None
+
+
+def cmd_sync(config):
+    err = F.main_checkout_error()
+    if err:
+        raise Refused(err)
+    limit = int(config.get("concurrency", 3))
+    busy = [j for j in all_jobs() if j["stage"] not in TERMINAL and j["stage"] not in WAITING]
+    if len(busy) < limit:
+        done_refs = {j["issue"].get("ref") for j in all_jobs()}
+        for item in backlog.list_ready(config):
+            if len(busy) >= limit:
+                break
+            if item["ref"] in done_refs:  # one job per issue; terminal jobs don't restart
+                continue
+            busy.append(new_job(config, item["ref"]))
+    for j in all_jobs():
+        if j["stage"] not in TERMINAL:
+            print("%s %s" % (j["id"], j["stage"]))
+
+
+def cmd_pick(config, arg):
+    """Resolve exactly one job for `/factory run <id>`: an existing job id, the open
+    job for a backlog ref, or a new job for a ref that is ready in the backlog.
+    Ignores concurrency. Never fetches a ref that list_ready did not return."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", arg or ""):
+        raise Refused("bad id or ref %r (allowed: letters, digits, '.', '_', '-')" % (arg or ""))
+    # Only touch job_dir/load for args shaped like a job id: they die on anything else.
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]*", arg) and (F.JOBS / arg / "job.json").exists():
+        job = load(arg)
+        if job["stage"] in TERMINAL:
+            raise Refused("%s is already %s" % (job["id"], job["stage"]))
+        return "%s %s" % (job["id"], job["stage"])
+    job = open_ref(arg)
+    if job:
+        return "%s %s" % (job["id"], job["stage"])
+    closed = [j for j in all_jobs() if j["issue"].get("ref") == arg]
+    if closed:
+        last = closed[-1]
+        raise Refused("%s is already %s" % (last["id"], last["stage"]))
+    if arg in {item["ref"] for item in backlog.list_ready(config)}:
+        job = new_job(config, arg)
+        return "%s %s" % (job["id"], job["stage"])
+    raise Refused("no job or ready backlog item for %s" % arg)
+
+
+# ---------------- helpers for next ----------------
+
+def jpath(job, name):
+    return job_dir(job["id"]) / name
+
+
+def token(config, agent, model):
+    """One SPAWN token, "<agent>:<model>" or "<agent>:<model>:<effort>" when the
+    current config sets an effort for that agent."""
+    effort = F.effort_for(config, agent)
+    return "%s:%s:%s" % (agent, model, effort) if effort else "%s:%s" % (agent, model)
+
+
+def record_efforts(job, agents):
+    """Set job["efforts"] to the effort of each agent's spawn in these tokens (key
+    dropped when a token has none; the whole field dropped when empty).
+    Returns True if the record changed."""
+    old = job.get("efforts")
+    efforts = dict(old) if isinstance(old, dict) else {}
+    for tok in agents:
+        parts = tok.split(":")
+        if len(parts) >= 3:
+            efforts[parts[0]] = parts[2]
+        else:
+            efforts.pop(parts[0], None)
+    if efforts == old:
+        return False
+    if efforts:
+        job["efforts"] = efforts
+    elif "efforts" in job:
+        del job["efforts"]
+    else:
+        return False
+    return True
+
+
+def spawn(job, *agents, out=None):
+    """The SPAWN line. Counts every out file in job["spawns"], records each
+    agent's effort in job["efforts"], and saves first (the record must not
+    depend on refresh_cost, which swallows errors)."""
+    changed = record_efforts(job, agents)
+    if out:
+        counts = job.setdefault("spawns", {})
+        for name in out:
+            counts[name] = counts.get(name, 0) + 1
+    if out or changed:
+        save(job)
+    line = "%s %s SPAWN %s" % (job["id"], job["stage"], " ".join(agents))
+    if out:
+        line += " out=" + ",".join(out)
+    return line
+
+
+def spawn_missing(job, pairs, uncapped=()):
+    """Spawn for out files that do not exist yet, at most MAX_SPAWNS times each.
+    pairs: [(agent:model, out file)]. Any exhausted pair -> ERROR naming every
+    exhausted one, and nothing is spawned. Out files in `uncapped` (respawns
+    after invalidate()) are counted but never block."""
+    counts = job.get("spawns") or {}
+    gone = ["%s did not write %s" % (agent.split(":", 1)[0], name)
+            for agent, name in pairs
+            if name not in uncapped and counts.get(name, 0) >= MAX_SPAWNS]
+    if gone:
+        return "ERROR %s: %s" % (job["id"], "; ".join(gone))
+    return spawn(job, *[a for a, _ in pairs], out=[n for _, n in pairs])
+
+
+def wait(job, who, note):
+    return "%s %s WAIT %s %s" % (job["id"], job["stage"], who, note)
+
+
+def done(job):
+    return "%s %s DONE %s" % (job["id"], job["stage"], job["stage"])
+
+
+def invalidate(path):
+    """An agent file without a parseable verdict: set it aside once and respawn.
+    Returns False if it was already set aside before (give up)."""
+    bad = path.with_name(path.stem + ".invalid.md")
+    if bad.exists():
+        return False
+    path.rename(bad)
+    return True
+
+
+def post(config, job, text):
+    try:
+        backlog.comment(config, job["issue"]["ref"], text)
+    except (RuntimeError, SystemExit) as e:
+        job["note"] = "could not post comment: %s" % e
+
+
+def mark(config, job, state):
+    try:
+        backlog.mark(config, job["issue"]["ref"], state)
+    except (RuntimeError, SystemExit):
+        pass
+
+
+def comment_text(path, fallback_heading=None):
+    text = path.read_text()
+    return F.section(text, "Comment") or (F.section(text, fallback_heading) if fallback_heading else None) or text
+
+
+def ensure_worktree(config, job):
+    wt_root = F.ROOT / config.get("worktree_root", "factory/worktrees")
+    wt = wt_root / job["id"]
+    branch = "factory/" + job["id"]
+    if not wt.exists():
+        if config.get("merge", "pr") == "pr":
+            F.git("fetch", config.get("remote", "origin"), config.get("base_branch", "main"))
+        exists = F.git("rev-parse", "--verify", "--quiet", "refs/heads/" + branch, check=False).returncode == 0
+        wt_root.mkdir(parents=True, exist_ok=True)
+        if exists:
+            F.git("worktree", "add", str(wt), branch)
+        else:
+            F.git("worktree", "add", "-b", branch, str(wt), job["base"])
+    job["branch"], job["worktree"] = branch, str(wt)
+
+
+def remove_worktree(job):
+    if job.get("worktree") and Path(job["worktree"]).exists():
+        F.git("worktree", "remove", "--force", job["worktree"], check=False)
+    job["worktree"] = None
+
+
+def next_round(config, job, note, files_note=""):
+    """Back to the builder, or to a human when out of rounds."""
+    if job["round"] + 1 > job["max_rounds"]:
+        move(job, "needs-human", "out of rounds (%d): %s" % (job["max_rounds"], note))
+        mark(config, job, "needs-human")
+        return wait(job, "human", job["note"])
+    move(job, "build", note, round_inc=True)
+    return spawn(job, token(config, "builder", job["models"]["builder"]), out=["build-%d.md" % job["round"]])
+
+
+def push_and_pr(config, job):
+    if config.get("merge", "pr") != "pr":
+        return
+    ahead = F.git("rev-list", "--count", "%s..HEAD" % job["base"], cwd=job["worktree"], check=False).stdout.strip()
+    if ahead in ("", "0"):
+        return  # nothing to push; the gate fails it with "no commits ahead"
+    remote = config.get("remote", "origin")
+    F.git("push", "--force-with-lease", "-u", remote, job["branch"], cwd=job["worktree"])
+    if job.get("pr"):
+        return
+    spec = F.section(jpath(job, "spec.md").read_text(), "Summary") if jpath(job, "spec.md").exists() else ""
+    closes = ("Closes #%s\n\n" % job["issue"]["ref"]) if job["issue"]["source"] == "github" else ""
+    body = "%sFactory job `%s`.\n\n%s\n" % (closes, job["id"], spec or "")
+    args = ["gh", "pr", "create", "--draft", "--head", job["branch"], "--base",
+            config.get("base_branch", "main"), "--title", job["title"], "--body-file", "-"]
+    repo = (config.get("github") or {}).get("repo")
+    if repo:
+        args += ["--repo", repo]
+    url = F.run(args, cwd=job["worktree"], check=True, input=body).stdout.strip().splitlines()[-1]
+    m = re.search(r"/pull/(\d+)", url)
+    job["pr"] = {"number": int(m.group(1)) if m else None, "url": url, "draft": True}
+    save(job)
+
+
+def gh_pr(config, job, *args, check=True):
+    cmd = ["gh", "pr"] + list(args)
+    repo = (config.get("github") or {}).get("repo")
+    if repo:
+        cmd += ["--repo", repo]
+    return F.run(cmd, cwd=F.ROOT, check=check)
+
+
+def run_gate(job, out_name):
+    p = F.run([str(HERE / "gate"), job["worktree"], job["base"], str(jpath(job, out_name))], cwd=F.ROOT)
+    line = (p.stdout.strip().splitlines() or ["FAIL gate crashed: " + p.stderr.strip()[-300:]])[-1]
+    return p.returncode == 0, line
+
+
+def next_feedback_path(job):
+    k = 1
+    while jpath(job, "feedback-%d.md" % k).exists():
+        k += 1
+    return jpath(job, "feedback-%d.md" % k)
+
+
+# ---------------- next ----------------
+
+def step(config, job):
+    st = job["stage"]
+    m = job["models"]
+
+    if st in TERMINAL:
+        return done(job)
+
+    if st == "intake":
+        f = jpath(job, "intake.md")
+        if not f.exists():
+            return spawn_missing(job, [(token(config, "intake", m["intake"]), "intake.md")])
+        text = f.read_text()
+        dec = F.verdict(text, "Decision", {"ACCEPT", "NEEDS-INFO", "REJECT"})
+        risk = (F.verdict(text, "Risk", set(F.RISKS) | {x.upper() for x in F.RISKS}) or "").lower() or None
+        if not dec or (dec == "ACCEPT" and risk not in F.RISKS):
+            if invalidate(f):
+                return spawn(job, token(config, "intake", m["intake"]), out=["intake.md"])
+            return "ERROR %s: intake.md has no valid Decision/Risk lines twice in a row" % job["id"]
+        job["verdicts"]["intake"] = dec
+        if dec == "REJECT":
+            post(config, job, "**Factory intake: REJECT**\n\n" + comment_text(f, "Reason"))
+            mark(config, job, "rejected")
+            move(job, "rejected", "intake REJECT")
+            return done(job)
+        if dec == "NEEDS-INFO":
+            post(config, job, "**Factory intake: needs info**\n\n" + comment_text(f, "Questions"))
+            # baseline the issue after our own comment, so only a reply wakes the job
+            meta, text2 = backlog.fetch(config, job["issue"]["ref"])
+            F.atomic_write(jpath(job, "issue.md"), text2)
+            job["issue_hash"] = issue_hash(jpath(job, "issue.md"))
+            move(job, "needs-info", "asked the author")
+            return wait(job, "author", "questions posted on the issue")
+        sm = re.search(r"^\s*\**Surfaces\**\s*:\s*(.*)$", text, re.M)
+        allowed = set((config.get("surfaces") or {}).keys())
+        surfaces = [s.strip().lower() for s in (sm.group(1) if sm else "").split(",")]
+        job["surfaces"] = sorted({s for s in surfaces if s in allowed})
+        job["risk"] = risk
+        job["reviewers"] = F.route(config, risk, job["surfaces"])
+        job["issue_hash"] = issue_hash(jpath(job, "issue.md"))
+        post(config, job, "**Factory intake: ACCEPT** (risk %s%s)\n\n%s" % (
+            risk, ", surfaces " + ", ".join(job["surfaces"]) if job["surfaces"] else "", comment_text(f, "Scope")))
+        try:
+            ensure_worktree(config, job)
+        except RuntimeError as e:
+            save(job)
+            return "ERROR %s: could not create worktree: %s" % (job["id"], e)
+        move(job, "spec", "ACCEPT risk=%s surfaces=%s reviewers=%s" % (
+            risk, ",".join(job["surfaces"]) or "none", ",".join(r["name"] for r in job["reviewers"]) or "none"))
+        return spawn(job, token(config, "spec-writer", m["spec-writer"]), out=["spec.md"])
+
+    if st == "needs-info":
+        tmp = jpath(job, ".issue.new.md")
+        meta, text = backlog.fetch(config, job["issue"]["ref"])
+        F.atomic_write(tmp, text)
+        if issue_hash(tmp) == job.get("issue_hash"):
+            tmp.unlink()
+            return wait(job, "author", "no reply yet")
+        os.replace(str(tmp), str(jpath(job, "issue.md")))
+        k = 1
+        while jpath(job, "intake-%d.md" % k).exists():
+            k += 1
+        if jpath(job, "intake.md").exists():
+            jpath(job, "intake.md").rename(jpath(job, "intake-%d.md" % k))
+        job.setdefault("spawns", {}).pop("intake.md", None)
+        move(job, "intake", "author replied")
+        return spawn(job, token(config, "intake", m["intake"]), out=["intake.md"])
+
+    if st == "spec":
+        if not jpath(job, "spec.md").exists():
+            return spawn_missing(job, [(token(config, "spec-writer", m["spec-writer"]), "spec.md")])
+        move(job, "build", "spec written", round_inc=True)
+        return spawn(job, token(config, "builder", m["builder"]), out=["build-%d.md" % job["round"]])
+
+    if st == "build":
+        out = "build-%d.md" % job["round"]
+        if not jpath(job, out).exists():
+            return spawn_missing(job, [(token(config, "builder", m["builder"]), out)])
+        move(job, "gate", "build round %d done" % job["round"])
+        st = "gate"
+
+    if st == "gate":
+        try:
+            push_and_pr(config, job)
+        except RuntimeError as e:
+            return "ERROR %s: push/PR failed: %s" % (job["id"], str(e)[:300])
+        ok, line = run_gate(job, "gate-%d.md" % job["round"])
+        job["verdicts"]["gate"][str(job["round"])] = "PASS" if ok else "FAIL"
+        if not ok:
+            return next_round(config, job, "gate %s" % line)
+        job["verdicts"]["review"][str(job["round"])] = {}
+        move(job, "review", "gate PASS")
+        st = "review"
+
+    if st == "review":
+        r = str(job["round"])
+        got = job["verdicts"]["review"].setdefault(r, {})
+        missing = []    # (reviewer, out file), in reviewer order; tokens built at spawn time
+        respawn = set()  # out files set aside by invalidate(): respawned uncapped, as before
+        for rev in job["reviewers"]:
+            name = "review-%s-%s.md" % (r, rev["name"])
+            pair = (rev, name)
+            f = jpath(job, name)
+            if rev["name"] in got:
+                continue
+            if not f.exists():
+                missing.append(pair)
+                continue
+            v = F.verdict(f.read_text(), "Verdict", {"PASS", "CHANGES"})
+            if v is None:
+                if invalidate(f):
+                    missing.append(pair)
+                    respawn.add(name)
+                    continue
+                v = "CHANGES"
+            got[rev["name"]] = v
+        save(job)
+        if missing:
+            return spawn_missing(job, [(token(config, rev["name"], rev["model"]), name)
+                                       for rev, name in missing], uncapped=respawn)
+        changes = [n for n, v in got.items() if v != "PASS"]
+        if changes:
+            return next_round(config, job, "CHANGES from " + ", ".join(changes))
+        move(job, "approve", "all reviewers PASS")
+        st = "approve"
+
+    if st == "approve":
+        out = "approve-%d.md" % job["round"]
+        f = jpath(job, out)
+        if not f.exists():
+            return spawn_missing(job, [(token(config, "approver", m["approver"]), out)])
+        dec = F.verdict(f.read_text(), "Decision", {"APPROVE", "ESCALATE"})
+        if dec is None:
+            if invalidate(f):
+                return spawn(job, token(config, "approver", m["approver"]), out=[out])
+            dec = "ESCALATE"
+        job["verdicts"]["approve"][str(job["round"])] = dec
+        if dec == "ESCALATE":
+            text = comment_text(f, "Question")
+            if job.get("pr"):
+                gh_pr(config, job, "ready", str(job["pr"]["number"]), check=False)
+                job["pr"]["draft"] = False
+                gh_pr(config, job, "comment", str(job["pr"]["number"]), "--body", "**Factory approver: ESCALATE**\n\n" + text, check=False)
+            else:
+                post(config, job, "**Factory approver: ESCALATE**\n\n" + text)
+            mark(config, job, "needs-human")
+            move(job, "needs-human", "approver escalated")
+            return wait(job, "human", "approver escalated; see %s" % out)
+        move(job, "merging", "approver APPROVE")
+        return do_merge(config, job)
+
+    if st == "merging":
+        return do_merge(config, job)
+
+    if st == "needs-human":
+        if job.get("pr") and job["pr"].get("number"):
+            p = gh_pr(config, job, "view", str(job["pr"]["number"]), "--json", "state", "--jq", ".state", check=False)
+            if p.returncode == 0 and p.stdout.strip() == "MERGED":
+                finish_merged(config, job, "merged by a human on GitHub")
+                return done(job)
+        return wait(job, "human", job.get("note", ""))
+
+    return "ERROR %s: unknown stage %s" % (job["id"], st)
+
+
+# ---------------- merge ----------------
+
+def finish_merged(config, job, how):
+    F.atomic_write(jpath(job, "merge.md"), F.summary_md([
+        "Merged `%s` into `%s`" % (job.get("branch"), config.get("base_branch", "main")),
+        how,
+        "PR: %s" % job["pr"]["url"] if job.get("pr") else "merge mode: %s" % config.get("merge", "pr"),
+        "%d build round(s)" % job["round"],
+    ]))
+    mark(config, job, "done")
+    remove_worktree(job)
+    if job.get("branch"):
+        if config.get("merge", "pr") == "pr":
+            F.git("push", config.get("remote", "origin"), "--delete", job["branch"], check=False)
+        F.git("branch", "-D", job["branch"], check=False)
+    move(job, "merged", how)
+
+
+def conflict_feedback(job, base, files):
+    F.atomic_write(next_feedback_path(job), F.summary_md([
+        "Merge conflict syncing `%s` with `%s`" % (job["branch"], base),
+        "Conflicting files: %s" % (", ".join(files[:10]) or "unknown"),
+        "Merge `%s` into the branch, resolve, re-run the checks, commit" % base,
+    ], "## Feedback\n\nAnother change landed on `%s` first. Merge it into your branch "
+       "(`git merge %s`), resolve the conflicts keeping both intents, and commit.\n" % (base, base)))
+
+
+def do_merge(config, job):
+    mode = config.get("merge", "pr")
+    base_branch = config.get("base_branch", "main")
+    wt = job.get("worktree")
+    if not wt or not Path(wt).exists():
+        move(job, "needs-human", "worktree missing; cannot merge")
+        return wait(job, "human", job["note"])
+    with merge_lock():
+        if mode == "pr":
+            F.git("fetch", config.get("remote", "origin"), base_branch, cwd=wt, check=False)
+        p = F.git("merge", "--no-edit", job["base"], cwd=wt, check=False)
+        if p.returncode != 0:
+            files = F.git("diff", "--name-only", "--diff-filter=U", cwd=wt, check=False).stdout.split()
+            F.git("merge", "--abort", cwd=wt, check=False)
+            conflict_feedback(job, job["base"], files)
+            return next_round(config, job, "merge conflict with %s" % job["base"])
+        ok, line = run_gate(job, "merge-gate-%d.md" % job["round"])
+        job["verdicts"]["merge_gate"][str(job["round"])] = "PASS" if ok else "FAIL"
+        if not ok:
+            F.atomic_write(next_feedback_path(job), F.summary_md([
+                "Checks fail after syncing with `%s`" % job["base"],
+                line,
+                "See merge-gate-%d.md / .log" % job["round"],
+            ], "## Feedback\n\nThe branch passed on its own but fails once merged with the latest "
+               "`%s`. The merge commit is on your branch; fix the failure and commit.\n" % job["base"]))
+            return next_round(config, job, "merge gate " + line)
+
+        if mode == "pr":
+            try:
+                F.git("push", "-u", config.get("remote", "origin"), job["branch"], cwd=wt)
+            except RuntimeError as e:
+                move(job, "needs-human", "push failed: %s" % str(e)[:200])
+                return wait(job, "human", job["note"])
+            n = str(job["pr"]["number"])
+            gh_pr(config, job, "ready", n, check=False)
+            job["pr"]["draft"] = False
+            method = "--" + config.get("merge_method", "squash")
+            p = gh_pr(config, job, "merge", n, method, check=False)
+            if p.returncode != 0:
+                move(job, "needs-human", "gh pr merge failed: %s" % (p.stderr or p.stdout).strip()[-200:])
+                mark(config, job, "needs-human")
+                return wait(job, "human", job["note"])
+            finish_merged(config, job, "merged PR #%s (%s)" % (n, method[2:]))
+            return done(job)
+
+        # local: the merge already happened in the job worktree; fast-forward the base.
+        sha = F.git("rev-parse", "HEAD", cwd=wt).stdout.strip()
+        holder = None
+        cur = None
+        for line in F.git("worktree", "list", "--porcelain").stdout.splitlines():
+            if line.startswith("worktree "):
+                cur = line[9:]
+            elif line == "branch refs/heads/" + base_branch:
+                holder = cur
+        if holder:
+            p = F.git("merge", "--ff-only", sha, cwd=holder, check=False)
+            if p.returncode != 0:
+                move(job, "needs-human", "could not fast-forward %s in %s: %s" % (
+                    base_branch, holder, (p.stderr or p.stdout).strip()[-200:]))
+                return wait(job, "human", job["note"])
+        else:
+            old = F.git("rev-parse", "refs/heads/" + base_branch).stdout.strip()
+            F.git("update-ref", "refs/heads/" + base_branch, sha, old)
+        finish_merged(config, job, "fast-forwarded %s to %s" % (base_branch, sha[:10]))
+        return done(job)
+
+
+# ---------------- human commands ----------------
+
+def cmd_feedback(config, job, text):
+    if job["stage"] in TERMINAL:
+        raise Refused("%s is %s" % (job["id"], job["stage"]))
+    if job["stage"] in ("intake", "needs-info"):
+        raise Refused("%s has no build yet; edit the issue instead" % job["id"])
+    if not text.strip():
+        raise Refused("empty feedback")
+    path = next_feedback_path(job)
+    first = text.strip().splitlines()[0][:120]
+    F.atomic_write(path, F.summary_md([
+        "Feedback from the operator for `%s`" % job["id"],
+        "Given at stage `%s`, round %d" % (job["stage"], job["round"]),
+        "Starts: %s" % first,
+    ], "## Feedback\n\n" + text.strip() + "\n"))
+    if job["stage"] in ("gate", "review", "approve", "needs-human"):
+        if job["stage"] == "needs-human":
+            mark(config, job, "active")
+        job["max_rounds"] = max(job["max_rounds"], job["round"] + 1)  # a human asked for this round
+        move(job, "build", "operator feedback (%s)" % path.name, round_inc=True)
+        return spawn(job, token(config, "builder", job["models"]["builder"]), out=["build-%d.md" % job["round"]])
+    save(job)
+    return "%s %s OK %s recorded; the next build round reads it" % (job["id"], job["stage"], path.name)
+
+
+def cmd_reject(config, job, reason):
+    if job["stage"] in TERMINAL:
+        raise Refused("%s is already %s" % (job["id"], job["stage"]))
+    reason = reason.strip() or "Rejected by the operator."
+    F.atomic_write(jpath(job, "reject.md"), F.summary_md([
+        "Rejected by the operator at stage `%s`" % job["stage"],
+        reason.splitlines()[0][:160],
+        "PR closed" if job.get("pr") else "no PR",
+    ], "## Reason\n\n" + reason + "\n"))
+    post(config, job, "**Factory: rejected**\n\n" + reason)
+    if job.get("pr") and job["pr"].get("number"):
+        gh_pr(config, job, "close", str(job["pr"]["number"]), check=False)
+    mark(config, job, "rejected")
+    remove_worktree(job)
+    move(job, "rejected", "rejected by operator")
+    return done(job)
+
+
+def cmd_approve(config, job):
+    if job["stage"] != "needs-human":
+        raise Refused("%s is %s, not needs-human" % (job["id"], job["stage"]))
+    mark(config, job, "active")
+    move(job, "merging", "approved by operator")
+    return do_merge(config, job)
+
+
+def cmd_retry(job):
+    """Forget the spawn counts of out files that still do not exist, so `next` asks again."""
+    if job["stage"] in TERMINAL:
+        raise Refused("%s is %s" % (job["id"], job["stage"]))
+    counts = job.setdefault("spawns", {})
+    cleared = sorted(n for n in counts if not jpath(job, n).exists())
+    for n in cleared:
+        del counts[n]
+    save(job)
+    return "%s %s OK retry: %s" % (job["id"], job["stage"],
+                                   "cleared " + ",".join(cleared) if cleared else "nothing to clear")
+
+
+def cmd_check(job):
+    """Run the main checkout's checks.sh in the job worktree. Changes no state."""
+    import subprocess
+    wt = job.get("worktree")
+    if not wt or not Path(wt).is_dir():
+        print("ERROR %s has no worktree" % job["id"])
+        return 1
+    env = dict(os.environ, FACTORY_WORKTREE=wt, FACTORY_ROOT=str(F.ROOT), PYTHONDONTWRITEBYTECODE="1")
+    p = subprocess.run(["bash", str(F.FACTORY / "checks.sh")], cwd=wt, env=env, text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    print("\n".join(p.stdout.rstrip().splitlines()[-80:]))
+    print("CHECKS %s (exit %d)" % ("PASS" if p.returncode == 0 else "FAIL", p.returncode))
+    return 0 if p.returncode == 0 else 1
+
+
+# ---------------- cost ----------------
+
+def project_slug(path):
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def price_for(model_id, prices, aliases):
+    for alias, mid in aliases.items():
+        if model_id == mid and alias in prices:
+            return prices[alias]
+    for alias in prices:
+        if alias in (model_id or ""):
+            return prices[alias]
+    return None
+
+
+def first_prompt(lines):
+    for line in lines[:20]:
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        msg = o.get("message") or {}
+        if o.get("type") == "user" or msg.get("role") == "user":
+            c = msg.get("content")
+            if isinstance(c, list):
+                c = "\n".join(b.get("text", "") for b in c if isinstance(b, dict))
+            return c or ""
+    return ""
+
+
+def compute_cost(config, job):
+    jd = str(job_dir(job["id"]).resolve())
+    pat = re.compile(r"Factory job:\s*%s(?=\s|$)" % re.escape(jd))
+    prices = config.get("prices_usd_per_mtok") or {}
+    aliases = (config.get("models") or {}).get("aliases") or {}
+    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    base = home / "projects" / project_slug(F.ROOT.resolve())
+    tot = {"usd": 0.0, "input_tokens": 0, "output_tokens": 0, "cache_write_tokens": 0,
+           "cache_read_tokens": 0, "by_agent": {}, "transcripts": 0}
+    for path in glob.glob(str(base / "**" / "subagents" / "*.jsonl"), recursive=True):
+        try:
+            lines = Path(path).read_text().splitlines()
+        except OSError:
+            continue
+        prompt = first_prompt(lines)
+        if not pat.search(prompt):
+            continue
+        am = re.search(r"^Agent:\s*(\S+)", prompt, re.M)
+        agent = am.group(1) if am else "unknown"
+        tot["transcripts"] += 1
+        msgs = {}
+        for i, line in enumerate(lines):
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            msg = o.get("message") or {}
+            if not isinstance(msg, dict) or not msg.get("usage"):
+                continue
+            msgs[msg.get("id") or "line%d" % i] = msg  # streamed duplicates: keep the last
+        for msg in msgs.values():
+            u = msg["usage"]
+            p = price_for(msg.get("model"), prices, aliases) or {}
+            it, ot = u.get("input_tokens", 0) or 0, u.get("output_tokens", 0) or 0
+            cw, cr = u.get("cache_creation_input_tokens", 0) or 0, u.get("cache_read_input_tokens", 0) or 0
+            usd = (it * p.get("input", 0) + ot * p.get("output", 0) + cw * p.get("cache_write", 0)
+                   + cr * p.get("cache_read", 0)) / 1e6
+            tot["usd"] += usd
+            tot["input_tokens"] += it
+            tot["output_tokens"] += ot
+            tot["cache_write_tokens"] += cw
+            tot["cache_read_tokens"] += cr
+            tot["by_agent"][agent] = round(tot["by_agent"].get(agent, 0) + usd, 4)
+    tot["usd"] = round(tot["usd"], 4)
+    tot["updated_at"] = F.now()
+    return tot
+
+
+def refresh_cost(config, job):
+    try:
+        job["cost"] = compute_cost(config, job)
+        save(job)
+    except Exception:  # cost is best-effort; never block the pipeline on it
+        pass
+
+
+# ---------------- main ----------------
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    args = argv[2:]
+    config = F.load_config()
+    try:
+        if cmd == "sync" and not args:
+            cmd_sync(config)
+        elif cmd == "list":
+            for j in all_jobs():
+                if "--all" in args or j["stage"] not in TERMINAL:
+                    print("%s %s r%d %s" % (j["id"], j["stage"], j["round"], j.get("note", "")))
+        elif cmd == "show" and args:
+            j = load(args[0])
+            print(json.dumps(j[args[1]] if len(args) > 1 else j, indent=2))
+        elif cmd == "new" and len(args) == 1:
+            j = open_ref(args[0])
+            if j:
+                raise Refused("ref %s already has open job %s" % (args[0], j["id"]))
+            j = new_job(config, args[0])
+            print("%s %s" % (j["id"], j["stage"]))
+        elif cmd == "pick" and len(args) == 1:
+            print(cmd_pick(config, args[0]))
+        elif cmd == "check" and len(args) == 1:
+            return cmd_check(load(args[0]))
+        elif cmd in ("next", "feedback", "reject", "approve", "merge", "move", "cost", "retry") and args:
+            jid = args[0]
+            if cmd in ("next", "feedback", "approve", "merge"):
+                # These can print SPAWN: refuse a bad efforts map before any lock or state change.
+                err = F.efforts_error(config)
+                if err:
+                    raise Refused(err)
+            with locked(jid):
+                job = load(jid)
+                if cmd == "next":
+                    out = step(config, job)
+                    refresh_cost(config, job)
+                elif cmd == "feedback":
+                    out = cmd_feedback(config, job, sys.stdin.read())
+                elif cmd == "reject":
+                    out = cmd_reject(config, job, sys.stdin.read())
+                elif cmd == "approve":
+                    out = cmd_approve(config, job)
+                elif cmd == "retry":
+                    out = cmd_retry(job)
+                elif cmd == "merge":
+                    if job["stage"] != "merging":
+                        raise Refused("%s is %s, not merging" % (jid, job["stage"]))
+                    out = do_merge(config, job)
+                elif cmd == "move" and len(args) == 2:
+                    move(job, args[1], "manual move")
+                    out = "%s %s OK" % (jid, job["stage"])
+                elif cmd == "cost":
+                    job["cost"] = compute_cost(config, job)
+                    save(job)
+                    out = "%s cost $%.4f over %d transcript(s)" % (jid, job["cost"]["usd"], job["cost"]["transcripts"])
+                else:
+                    raise Refused("usage: job move <id> <stage>")
+            print(out)
+        else:
+            print(__doc__.strip())
+            return 2
+    except Refused as e:
+        print("ERROR " + str(e))
+        return 1
+    except RuntimeError as e:
+        print("ERROR " + str(e).replace("\n", " ")[:500])
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

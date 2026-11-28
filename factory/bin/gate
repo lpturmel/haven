@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""gate: decide whether a job branch works. Scripts decide; agents don't.
+
+    factory/bin/gate <worktree> <base-ref> <out.md>
+
+1. Fails if the worktree has uncommitted changes (the builder must commit).
+2. Fails if the branch has no commits ahead of <base-ref>.
+3. Fails if the branch modified or deleted any file matching
+   config.protected_paths (fnmatch globs, relative to the repo root).
+4. Runs the MAIN checkout's factory/checks.sh with cwd=<worktree>, so a branch
+   can't edit the checks it is judged by.
+
+Writes <out.md> (## Summary + Result line) and <out>.log (full output).
+Prints one line "PASS" or "FAIL <reason>"; exit 0 on PASS, 1 on FAIL.
+"""
+import fnmatch
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import factorylib as F  # noqa: E402
+
+
+def protected_hits(worktree, base, patterns):
+    mb = F.git("merge-base", base, "HEAD", cwd=worktree).stdout.strip()
+    names = F.git("diff", "--name-only", "--no-renames", mb, "HEAD", cwd=worktree).stdout.split()
+    return [n for n in names if any(fnmatch.fnmatch(n, p) for p in patterns)]
+
+
+def main(argv):
+    if len(argv) != 4:
+        print(__doc__.strip())
+        return 2
+    worktree, base, out = Path(argv[1]).resolve(), argv[2], Path(argv[3])
+    log_path = out.with_suffix(".log")
+    config = F.load_config()
+    checks = F.FACTORY / "checks.sh"
+    reason, log, detail = None, "", []
+
+    if not worktree.is_dir():
+        reason = "worktree %s does not exist" % worktree
+    if not reason:
+        dirty = F.git("status", "--porcelain", "--untracked-files=normal", cwd=worktree).stdout.strip()
+        if dirty:
+            reason = "uncommitted changes in worktree"
+            detail.append("```\n%s\n```" % dirty[:2000])
+    if not reason:
+        ahead = F.git("rev-list", "--count", "%s..HEAD" % base, cwd=worktree, check=False).stdout.strip()
+        if ahead in ("", "0"):
+            reason = "no commits ahead of %s" % base
+    if not reason:
+        hits = protected_hits(worktree, base, config.get("protected_paths") or [])
+        if hits:
+            reason = "branch changes protected paths: %s" % ", ".join(hits[:10])
+            detail.append("Protected paths may only change outside the factory. Revert these files to %s." % base)
+    if not reason:
+        if not checks.exists():
+            reason = "no factory/checks.sh in the main checkout"
+        else:
+            env = dict(os.environ, FACTORY_WORKTREE=str(worktree), FACTORY_ROOT=str(F.ROOT),
+                       PYTHONDONTWRITEBYTECODE="1")
+            try:
+                p = subprocess.run(["bash", str(checks)], cwd=str(worktree), env=env, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   timeout=int(config.get("gate_timeout_sec", 1800)))
+                log = p.stdout
+                if p.returncode != 0:
+                    reason = "checks.sh exited %d" % p.returncode
+            except subprocess.TimeoutExpired as e:
+                log = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+                reason = "checks.sh timed out"
+
+    F.atomic_write(log_path, log)
+    result = "FAIL" if reason else "PASS"
+    tail = "\n".join(log.rstrip().splitlines()[-60:])
+    body = "## Verdict\n\nResult: %s\n" % result
+    if detail:
+        body += "\n" + "\n\n".join(detail) + "\n"
+    if tail:
+        body += "\n## Log tail\n\nFull log: `%s`\n\n```\n%s\n```\n" % (log_path.name, tail)
+    F.atomic_write(out, F.summary_md([
+        "Gate %s for `%s` against `%s`" % (result, worktree.name, base),
+        reason or "checks.sh passed, no protected paths touched",
+        "checks: main checkout's `factory/checks.sh`",
+        "full log: `%s` (%d lines)" % (log_path.name, len(log.splitlines())),
+    ], body))
+    print(result if not reason else "FAIL " + reason)
+    return 1 if reason else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""builder-check: the builder's SubagentStop hook. A nudge, not the gate.
+
+Reads the hook JSON on stdin, finds the job from the builder's first prompt
+("Factory job: <folder>"), and runs the main checkout's factory/checks.sh in
+the job's worktree. On failure it exits 2 with the log tail on stderr, which
+keeps the builder working. It lets the builder stop on a second attempt
+(stop_hook_active) and whenever it can't work out the job, so it never traps
+an agent. factory/bin/gate is still what decides.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import factorylib as F  # noqa: E402
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    if data.get("stop_hook_active"):
+        return 0
+    tpath = data.get("agent_transcript_path") or ""
+    if not tpath or not Path(tpath).exists():
+        return 0
+    head = Path(tpath).read_text()[:20000]
+    m = re.search(r"Factory job:\s*(\S+?)(?:\\n|\s|\")", head)
+    if not m:
+        return 0
+    job_json = Path(m.group(1)) / "job.json"
+    try:
+        wt = json.loads(job_json.read_text()).get("worktree")
+    except (OSError, ValueError):
+        return 0
+    checks = F.FACTORY / "checks.sh"
+    if not wt or not Path(wt).is_dir() or not checks.exists():
+        return 0
+    env = dict(os.environ, FACTORY_WORKTREE=wt, FACTORY_ROOT=str(F.ROOT), PYTHONDONTWRITEBYTECODE="1")
+    try:
+        p = subprocess.run(["bash", str(checks)], cwd=wt, env=env, text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1200)
+    except subprocess.TimeoutExpired:
+        return 0
+    if p.returncode == 0:
+        return 0
+    tail = "\n".join(p.stdout.rstrip().splitlines()[-40:])
+    sys.stderr.write("factory/checks.sh fails in %s (exit %d). Fix it and commit before you "
+                     "finish, or say in your build file why you can't.\n\n%s\n" % (wt, p.returncode, tail))
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

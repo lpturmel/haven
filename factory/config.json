@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "name": "haven",
+  "backlog": "github",
+  "backlog_dir": "factory/backlog",
+  "github": {
+    "repo": "lpturmel/haven",
+    "label": "factory",
+    "needs_human_label": "factory:needs-human"
+  },
+  "merge": "pr",
+  "merge_method": "squash",
+  "base_branch": "main",
+  "remote": "origin",
+  "worktree_root": "factory/worktrees",
+  "concurrency": 3,
+  "max_rounds": 4,
+  "gate_timeout_sec": 1800,
+  "protected_paths": [
+    "factory/checks.sh",
+    "factory/config.json",
+    "factory/bin/*",
+    ".claude/agents/*",
+    ".claude/skills/factory/*",
+    ".claude/settings.json"
+  ],
+  "surfaces": {
+    "ui": "Changes anything the user sees or interacts with in the GPUI app: views, layout, colors, fonts, sidebar, path bar, menus, context menus, keyboard shortcuts, drag and drop, dialogs or the Settings window."
+  },
+  "models": {
+    "aliases": {
+      "fable": "claude-fable-5-2",
+      "opus": "claude-opus-5-5",
+      "sonnet": "claude-sonnet-5-5",
+      "haiku": "claude-haiku-5-5"
+    },
+    "agents": {
+      "intake": "fable",
+      "spec-writer": "opus",
+      "builder": "opus",
+      "approver": "opus"
+    },
+    "efforts": {
+      "spec-writer": "high",
+      "approver": "high",
+      "code-reviewer": "xhigh"
+    }
+  },
+  "reviewers": [
+    {
+      "name": "code-reviewer",
+      "purpose": "Correctness, scope and test integrity of the diff.",
+      "model": "opus",
+      "when": "always"
+    },
+    {
+      "name": "ui-reviewer",
+      "purpose": "Visual fit with the existing design.",
+      "model": "haiku",
+      "when": "ui"
+    },
+    {
+      "name": "ux-reviewer",
+      "purpose": "Usability of flows, states, copy and accessibility.",
+      "model": "sonnet",
+      "when": "ui"
+    },
+    {
+      "name": "perf-reviewer",
+      "purpose": "Hot paths, allocations, queries, frame budget.",
+      "model": "sonnet",
+      "when": "high"
+    }
+  ],
+  "prices_usd_per_mtok": {
+    "fable": {
+      "input": 8.0,
+      "output": 40.0,
+      "cache_write": 10.0,
+      "cache_read": 0.2
+    },
+    "opus": {
+      "input": 4.0,
+      "output": 20.0,
+      "cache_write": 5.0,
+      "cache_read": 0.2
+    },
+    "sonnet": {
+      "input": 2.0,
+      "output": 10.0,
+      "cache_write": 2.5,
+      "cache_read": 0.1
+    },
+    "haiku": {
+      "input": 0.1,
+      "output": 0.5,
+      "cache_write": 0.125,
+      "cache_read": 0.01
+    }
+  }
+}

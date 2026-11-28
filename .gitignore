@@ -1,2 +1,6 @@
 /target
 .DS_Store
+
+# software factory (local state)
+factory/jobs/
+factory/worktrees/
