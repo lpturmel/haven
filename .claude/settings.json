@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(factory/bin/job:*)",
+      "Bash(factory/bin/backlog list)",
+      "Bash(git -C:*)",
+      "Bash(chmod +x:*)",
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit",
+      "Write",
+      "Bash(/Users/lpturmel/dev2/tools/haven/factory/bin/job:*)"
+    ]
+  }
+}

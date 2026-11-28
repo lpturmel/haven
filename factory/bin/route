@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""route: pick reviewers and their models from risk + surfaces via config.json.
+
+    factory/bin/route <low|medium|high> [surface,surface,...]
+
+Prints a JSON list: [{"name": ..., "model": <alias>, "model_id": <id>}, ...]
+
+A reviewer in config.json is {name, purpose, model, when}:
+  model  an alias ("haiku") or a map by risk ({"low": "haiku", "medium": "sonnet"})
+  when   "always" | a risk level (runs at that risk or higher) | a surface name,
+         or a list of those (runs if any matches)
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import factorylib as F  # noqa: E402
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if len(argv) >= 2 else 2
+    risk = argv[1]
+    if risk not in F.RISKS:
+        F.die("risk must be one of %s" % ", ".join(F.RISKS))
+    surfaces = [s.strip() for s in (argv[2] if len(argv) > 2 else "").split(",") if s.strip() and s.strip() != "none"]
+    print(json.dumps(F.route(F.load_config(), risk, surfaces)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
